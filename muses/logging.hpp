@@ -1,3 +1,25 @@
+// MIT License
+
+// Copyright (c) 2023 nastyapple
+
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 #pragma once
 
 #ifndef _LOGGING_HPP
@@ -15,6 +37,7 @@
 #include <string>
 #include <tuple>
 #include <cstring>
+#include <sstream>
 
 #ifndef MUSES_LOG_LEVEL
 #define MUSES_LOG_LEVEL LogLevel::Debug
@@ -69,6 +92,7 @@ private:
             std::unique_lock<std::mutex> lock(mutex);
             cv.wait(lock,[this]{return (!this->msg_queue.empty()) || !this->is_running;});
             {
+                std::stringstream ss;
                 while(!msg_queue.empty()) {
                     std::tuple<LogLevel, std::string, std::string, std::time_t> msg;
                     msg_queue.wait_and_pop(msg);
@@ -77,14 +101,13 @@ private:
                     std::strftime(time_string, sizeof(time_string), "%Y-%m-%d %H:%M:%S", std::localtime(&std::get<3>(msg)));
                     std::string time_str(time_string);
                     std::string level_str = get_level_string(std::get<0>(msg));
-                    write_buffer += '[';
-                    write_buffer += level_str +"] ";
-                    write_buffer += time_str + ' ';
-                    write_buffer += std::get<1>(msg) + ": ";
-                    write_buffer += std::get<2>(msg) + '\n';
+                    ss << '[' << level_str << "] " << time_string << ' ' << std::get<1>(msg) << ": " << std::get<2>(msg) << std::endl;
                 }
+                write_buffer += ss.str();
+                ss.str("");
+                ss.clear();
             }
-            if(write_buffer.size() >= 1024 || !is_running) {
+            if(write_buffer.size() >= 4096 || !is_running) {
                 std::ofstream file(log_filename, std::ios::out|std::ios::app);
                 file << write_buffer;
                 file.close();
