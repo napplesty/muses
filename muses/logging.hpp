@@ -107,7 +107,7 @@ private:
                 ss.str("");
                 ss.clear();
             }
-            if(write_buffer.size() >= 4096 || !is_running) {
+            if(write_buffer.size() >= 32 || !is_running) {
                 std::ofstream file(log_filename, std::ios::out|std::ios::app);
                 file << write_buffer;
                 file.close();

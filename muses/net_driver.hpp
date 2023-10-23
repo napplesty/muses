@@ -27,25 +27,19 @@
 
 #include <string>
 #include <iostream>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include <tuple>
+#include <map>
 #include <sstream>
 #include <functional>
 #include <future>
-#include "muses/logging.hpp"
-#include "muses/queue.hpp"
-#include "muses/thread_pool.hpp"
-#include "muses/memory_pool.hpp"
 #include <condition_variable>
-#include <sys/_types/_socklen_t.h>
-#include <sys/_types/_ssize_t.h>
-#include <tuple>
-#include <map>
 
-#ifdef __APPLE__
-#include <sys/event.h>
-#endif
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#include "muses/logging.hpp"
 
 namespace muses {
 
@@ -60,7 +54,6 @@ template <class context_class>
 class ConnectionHandler {
 public:
     virtual bool init_muxer(int listen_fd) = 0;
-    virtual void init_message_protocol(std::function<bool (context_class *, int connected_fd)>) = 0;
 };
 
 // To realize the functions.
@@ -70,7 +63,7 @@ public:
     ip(ip), port(port),
     running(false), listen_fd(-1) {}
 
-    ~TCPListener() {shutdown(listen_fd, 2);}
+    ~TCPListener() {close(listen_fd);}
 
     bool init_listener() {
         struct sockaddr_in address{};
@@ -82,10 +75,10 @@ public:
             return false;
         }
 
-        if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR|SO_REUSEPORT, &opt, sizeof(opt))) {
-            MUSES_ERROR("tcp setsockopt failed");
-            return false;
-        }
+        // if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR|SO_REUSEPORT, &opt, sizeof(opt))) {
+        //     MUSES_ERROR("tcp setsockopt failed");
+        //     return false;
+        // }
 
         address.sin_family = AF_INET;
         address.sin_addr.s_addr = inet_addr(ip.c_str());
@@ -124,14 +117,26 @@ private:
     std::string ip;
 };
 
+}; // namespace muses
+
 #ifdef __APPLE__
 
+#include <sys/_types/_socklen_t.h>
+#include <sys/_types/_ssize_t.h>
+#include <sys/file.h>
+#include <sys/event.h>
+#include "muses/queue.hpp"
+#include "muses/thread_pool.hpp"
+#include "muses/memory_pool.hpp"
+
+namespace muses {
 template <class context_class>
 class KqueueConnectionHandler : public ConnectionHandler<context_class> {
 public:
-    KqueueConnectionHandler(int max_events, int max_thread)
+    KqueueConnectionHandler(int max_events, int max_thread, std::function<bool (context_class *, int)> handle_func)
     :max_events(max_events),
     inited(false), running(true),
+    handle_func(handle_func),
     thread_handle_listen(&KqueueConnectionHandler<context_class>::add_connected_fd_to_queue, this),
     thread_recycle(&KqueueConnectionHandler<context_class>::recycle, this),
     max_thread(max_thread),
@@ -139,9 +144,12 @@ public:
     ~KqueueConnectionHandler() {
         if (inited) {
             running = false;
-            delete events;
             cv_handle_listen.notify_all();
+            cv_recycle.notify_all();
             thread_handle_listen.join();
+            thread_recycle.join();
+            close(kqueue_fd);
+            delete events;
         }
     }
 
@@ -167,10 +175,6 @@ public:
         inited = true;
         return inited;
     }
-
-    void init_message_protocol(std::function<bool (context_class *, int connected_fd)> handle_func) {
-        this->handle_func = handle_func;
-    };
 
 private:
     // Let a thread to retrieve the connected file descriptor
@@ -210,13 +214,12 @@ private:
                     EV_SET(&client_event, client_fd, EVFILT_READ, EV_ADD, 0, 0, nullptr);
                     if (kevent(kqueue_fd, &client_event, 1, nullptr, 0, 0) == -1) {
                         MUSES_ERROR("Failed to add client socket to kqueue");
-                        shutdown(client_fd, 2);
-                        // close(client_fd); // I do not know why my mac does not have this api
+                        close(client_fd);
                         continue;
                     }
                     this->context_map[client_fd] = static_cast<context_class *>(context_memory_pool.allocate());
                 } else if (filter == EVFILT_READ) {
-                    results_queue.push(std::move(std::tuple<int, std::future<bool> >(fd, thread_pool.enqueue(this->handle_func, context_map[fd]))));
+                    results_queue.push(std::move(std::tuple<int, std::future<bool> >(fd, thread_pool.enqueue(this->handle_func, context_map[fd], fd))));
                 }
             }
         }
@@ -235,6 +238,12 @@ private:
                         break;
                     }
                 }
+                struct kevent delete_connected_event{};
+                EV_SET(&delete_connected_event, std::get<0>(a_result), EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+                if (kevent(kqueue_fd, &delete_connected_event, 1, events, 1, 0) == -1) {
+                    MUSES_ERROR("Delete kqueue event failed");
+                }
+                close(std::get<0>(a_result));
             }
         }
     }
@@ -251,7 +260,7 @@ private:
     std::condition_variable cv_handle_listen;
     std::thread thread_handle_listen;
 
-    std::function<bool (context_class &, int connected_fd)> handle_func;
+    std::function<bool (context_class *, int connected_fd)> handle_func;
     std::map<int, context_class *> context_map;
     MemoryPool context_memory_pool;
 
@@ -261,9 +270,7 @@ private:
     std::condition_variable cv_recycle;
     std::thread thread_recycle;
 };
-
+}; // namespace muses
 #endif
-
-};
 
 #endif

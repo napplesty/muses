@@ -22,3 +22,14 @@ set ( MUSES_TEST_FUNCTION
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_executable(muses_test_function ${MUSES_TEST_FUNCTION})
+
+set ( MUSES_TEST_NET_DRIVER
+    tests/test_net_driver.cpp
+)
+
+set ( MUSES_TEST_NET_DRIVER_CLIENT
+    tests/test_net_driver_client.cpp
+)
+
+add_executable(muses_test_net_driver ${MUSES_TEST_NET_DRIVER})
+add_executable(muses_test_net_driver_client ${MUSES_TEST_NET_DRIVER_CLIENT})
