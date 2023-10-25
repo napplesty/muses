@@ -107,7 +107,7 @@ private:
                 ss.str("");
                 ss.clear();
             }
-            if(write_buffer.size() >= 32 || !is_running) {
+            if(write_buffer.size() >= 128 || !is_running) {
                 std::ofstream file(log_filename, std::ios::out|std::ios::app);
                 file << write_buffer;
                 file.close();
@@ -120,9 +120,9 @@ private:
     }
 
 public:
-    static Logger& get_instance() {
+    static Logger* get_instance() {
         static Logger logger(MUSES_LOG_LEVEL, MUSES_LOG_FILENAME);
-        return logger;
+        return &logger;
     }
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
@@ -148,10 +148,10 @@ private:
 };
 };
 
-#define MUSES_DEBUG(msg) muses::Logger::get_instance().log(muses::LogLevel::Debug,msg,__func__)
-#define MUSES_INFO(msg) muses::Logger::get_instance().log(muses::LogLevel::Info,msg,__func__)
-#define MUSES_WARNING(msg) muses::Logger::get_instance().log(muses::LogLevel::Warning,msg,__func__)
-#define MUSES_ERROR(msg) muses::Logger::get_instance().log(muses::LogLevel::Error,msg,__func__)
-#define MUSES_FATAL(msg) muses::Logger::get_instance().log(muses::LogLevel::Fatal,msg,__func__)
+#define MUSES_DEBUG(msg) muses::Logger::get_instance()->log(muses::LogLevel::Debug,msg,__func__)
+#define MUSES_INFO(msg) muses::Logger::get_instance()->log(muses::LogLevel::Info,msg,__func__)
+#define MUSES_WARNING(msg) muses::Logger::get_instance()->log(muses::LogLevel::Warning,msg,__func__)
+#define MUSES_ERROR(msg) muses::Logger::get_instance()->log(muses::LogLevel::Error,msg,__func__)
+#define MUSES_FATAL(msg) muses::Logger::get_instance()->log(muses::LogLevel::Fatal,msg,__func__)
 
 #endif

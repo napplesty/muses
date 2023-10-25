@@ -18,8 +18,11 @@ void thread_func(size_t id) {
 
 int main() {
     muses::ThreadPool pool(7);
+    muses::MemoryPool mp(sizeof(int)*100, 10);
+    mp.initialize();
+    std::cout << mp.allocate() << std::endl;
     std::vector<std::future<void> > results;
-    for (int i = 0; i < 100000; i++) {
+    for (int i = 0; i < 10; i++) {
         results.emplace_back(pool.enqueue(thread_func, i));
     }
     for (auto&& result: results) {

@@ -63,6 +63,9 @@ public:
     
     void *allocate() {
         std::lock_guard<std::mutex> lock(rw_mutex);
+        if(memory_pool == nullptr) {
+            this->initialize();
+        }
         for(unsigned int i = 0; i < num_blocks; i++) {
             if (!memory_pool[i].is_allocated) {
                 memory_pool[i].is_allocated = true;
