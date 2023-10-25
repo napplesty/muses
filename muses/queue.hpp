@@ -91,55 +91,6 @@ private:
     std::queue<T> data_queue;
     std::condition_variable data_control_condition;
 };
-
-template<typename T>
-class CopyThreadSafeQueue {
-public:
-    CopyThreadSafeQueue() 
-    : capacity(std::numeric_limits<unsigned int>::max()),
-    num_elem(0) {}
-
-    void set_capacity(unsigned int capacity) {
-        std::unique_lock<std::mutex> lock(mutex);
-        this->capacity = capacity;
-    }
-
-    // Notice: If the number of the elements surpasses the capacity of the queue,
-    // the push operation will be blocked until the number of elements 
-    // becomes lower than the capacity
-    void push(T new_value) {
-        std::unique_lock<std::mutex> lock(mutex);
-        data_control_condition.wait(lock, [this]{return this->capacity > this->num_elem;});
-        data_queue.push(std::move(new_value));
-        num_elem ++;
-        data_control_condition.notify_one();
-    }
-
-    T wait_and_pop() {
-        std::unique_lock<std::mutex> lock(mutex);
-        data_control_condition.wait(lock, [this]{return !this->data_queue.empty();});
-        T value = std::move(data_queue.front());
-        num_elem --;
-        data_queue.pop();
-        return value;
-    }
-
-    bool empty() {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (data_queue.empty()) {
-            return true;
-        }
-        return false;
-    }
-
-private:
-    unsigned int capacity;
-    unsigned int num_elem;
-    mutable std::mutex mutex;
-    std::queue<T> data_queue;
-    std::condition_variable data_control_condition;
-};
-
 };
 
 #endif

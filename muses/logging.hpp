@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <unistd.h>
 #ifndef _LOGGING_HPP
 #define _LOGGING_HPP
 
@@ -38,6 +39,8 @@
 #include <tuple>
 #include <cstring>
 #include <sstream>
+#include <memory>
+#include <atomic>
 
 #ifndef MUSES_LOG_LEVEL
 #define MUSES_LOG_LEVEL LogLevel::Debug
@@ -61,14 +64,12 @@ class Logger {
 private:
     Logger(LogLevel level, std::string log_filename)
     : level(level), is_running(true), 
-    write_buffer(), log_filename(log_filename), 
-    thread(&Logger::write_to, this){}
+    write_buffer(), log_filename(log_filename),
+    thread(&Logger::write_to) {}
 
     ~Logger() {
         {
-            std::unique_lock<std::mutex> lock(mutex);
             is_running = false;
-            cv.notify_all();
         }
         thread.join();
     }
@@ -87,33 +88,33 @@ private:
         }
     }
 
-    void write_to() {
-        while (true) {
-            std::unique_lock<std::mutex> lock(mutex);
-            cv.wait(lock,[this]{return (!this->msg_queue.empty()) || !this->is_running;});
+    static void write_to() {
+        Logger* logger = Logger::get_instance();
+        while (true) { 
+            usleep(10000);
             {
                 std::stringstream ss;
-                while(!msg_queue.empty()) {
+                while(!logger->msg_queue.empty()) {
                     std::tuple<LogLevel, std::string, std::string, std::time_t> msg;
-                    msg_queue.wait_and_pop(msg);
+                    logger->msg_queue.wait_and_pop(msg);
                     char time_string[50];
                     memset(time_string, '\0', sizeof(time_string));
                     std::strftime(time_string, sizeof(time_string), "%Y-%m-%d %H:%M:%S", std::localtime(&std::get<3>(msg)));
                     std::string time_str(time_string);
-                    std::string level_str = get_level_string(std::get<0>(msg));
+                    std::string level_str = logger->get_level_string(std::get<0>(msg));
                     ss << '[' << level_str << "] " << time_string << ' ' << std::get<1>(msg) << ": " << std::get<2>(msg) << std::endl;
                 }
-                write_buffer += ss.str();
+                logger->write_buffer += ss.str();
                 ss.str("");
                 ss.clear();
             }
-            if(write_buffer.size() >= 128 || !is_running) {
-                std::ofstream file(log_filename, std::ios::out|std::ios::app);
-                file << write_buffer;
+            if(logger->write_buffer.size() >= 128 || !logger->is_running) {
+                std::ofstream file(logger->log_filename, std::ios::out|std::ios::app);
+                file << logger->write_buffer;
                 file.close();
-                write_buffer.clear();
+                logger->write_buffer.clear();
             }
-            if(!is_running) {
+            if(!logger->is_running) {
                 break;
             }
         }
@@ -127,7 +128,7 @@ public:
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
 
-    void log(LogLevel level, const std::string &message, const std::string &func_name) {
+    void log(LogLevel level, const std::string message, const std::string &func_name) {
         if (level < this->level) {
             return;
         } else {
@@ -137,12 +138,10 @@ public:
     }
 
 private:
-    std::mutex mutex;
-    std::condition_variable cv;
     std::string write_buffer;
     std::thread thread;
     std::string log_filename;
-    bool is_running;
+    std::atomic<bool> is_running;
     LogLevel level;
     ThreadSafeQueue<std::tuple<LogLevel, std::string, std::string, std::time_t> > msg_queue;
 };

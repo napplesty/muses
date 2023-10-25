@@ -6,6 +6,7 @@
 #include <sstream>
 #include <vector>
 #include <future>
+#include <unistd.h>
 
 void thread_func(size_t id) {
     std::stringstream ss;
