@@ -34,6 +34,7 @@
 #include <functional>
 #include <future>
 #include <condition_variable>
+#include <set>
 
 #include <unistd.h>
 #include <sys/socket.h>
@@ -47,14 +48,14 @@ namespace muses {
 // Network Driver Interfaces
 class ListenHandler {
 public:
-    virtual bool init_listener() = 0;
-    virtual int get_listener() = 0;
+    virtual bool init_listener() {return false;};
+    virtual int get_listener() {return -1;};
 };
 
 template <class context_class>
 class ConnectionHandler {
 public:
-    virtual bool init(int listen_fd, std::function<bool(context_class *, int)>);
+    virtual bool init(int listen_fd, std::function<bool(context_class *, int)>) {return false;};
 };
 
 // To realize the functions.
@@ -132,7 +133,7 @@ private:
 namespace muses {
 
 template <class context_class>
-class KqueueConnectionHandler {
+class KqueueConnectionHandler : public ConnectionHandler<context_class> {
 public:
     KqueueConnectionHandler(int max_events, int max_threads)
     : max_events(max_events),
@@ -215,7 +216,11 @@ private:
                     }
                     cls_instance->context_map[client_fd] = static_cast<context_class *>(cls_instance->context_memory_pool.allocate());
                 } else {
-                    cls_instance->results_queue.push(std::move(std::tuple<int, std::future<bool> >(fd, cls_instance->process_threads->enqueue(cls_instance->process_func, cls_instance->context_map[fd], fd))));
+                    // avoid process fd that is already in the process queue
+                    if (cls_instance->occuping_fds.count(fd) == 0) {
+                        cls_instance->occuping_fds.insert(fd);
+                        cls_instance->results_queue.push(std::move(std::tuple<int, std::future<bool> >(fd, cls_instance->process_threads->enqueue(cls_instance->process_func, cls_instance->context_map[fd], fd))));
+                    }
                 }
             }
         }
@@ -243,6 +248,7 @@ private:
                 }
                 close(std::get<0>(a_result));
             }
+            cls_instance->occuping_fds.erase(std::get<0>(a_result));
         }
     }
 
@@ -261,6 +267,7 @@ public:
     std::function<bool(context_class *, int)> process_func;
     ThreadSafeQueue<std::tuple<int, std::future<bool> > > results_queue;
     MemoryPool context_memory_pool;
+    std::set<int> occuping_fds;
     std::map<int, context_class *> context_map;
 };
 }; // namespace muses
