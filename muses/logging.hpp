@@ -22,10 +22,10 @@
 
 #pragma once
 
-#include <unistd.h>
 #ifndef _LOGGING_HPP
 #define _LOGGING_HPP
 
+#include <unistd.h>
 #include <iostream>
 #include <mutex>
 #include <fstream>
@@ -106,7 +106,6 @@ private:
                 }
                 logger->write_buffer += ss.str();
                 ss.str("");
-                ss.clear();
             }
             if(logger->write_buffer.size() >= 128 || !logger->is_running) {
                 std::ofstream file(logger->log_filename, std::ios::out|std::ios::app);

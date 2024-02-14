@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.18)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 project(muses VERSION 0.0.1 LANGUAGES CXX)
@@ -13,6 +13,8 @@ set ( MUSES_HEADERS
     muses/thread_pool.hpp
     muses/queue.hpp
     muses/logging.hpp
+    muses/compiler_defs.hpp
+    muses/profiler.hpp
 )
 
 set ( MUSES_TEST_FUNCTION

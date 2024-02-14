@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #ifndef _NET_DRIVER_HPP
 #define _NET_DRIVER_HPP
 
@@ -53,7 +54,7 @@ public:
 };
 
 template <class context_class>
-class ConnectionHandler {
+class BaseConnectionHandler {
 public:
     virtual bool init(int listen_fd, std::function<bool(context_class *, int)>) {return false;};
 };
@@ -133,9 +134,9 @@ private:
 namespace muses {
 
 template <class context_class>
-class KqueueConnectionHandler : public ConnectionHandler<context_class> {
+class ConnectionHandler : public BaseConnectionHandler<context_class> {
 public:
-    KqueueConnectionHandler(int max_events, int max_threads)
+    ConnectionHandler(int max_events, int max_threads)
     : max_events(max_events),
     max_threads(max_threads),
     manage_threads(new ThreadPool(2)),
@@ -143,7 +144,7 @@ public:
     inited(false),
     context_memory_pool(sizeof(context_class)+1, max_events) {context_memory_pool.initialize();}
 
-    ~KqueueConnectionHandler() {
+    ~ConnectionHandler() {
         inited = false;
         delete manage_threads;
         delete process_threads;
@@ -173,13 +174,13 @@ public:
 
         MUSES_INFO("Server start. Waiting for connections...");
         inited = true;
-        manage_threads->enqueue(KqueueConnectionHandler<context_class>::internal_manage_connected_fd, this);
-        manage_threads->enqueue(KqueueConnectionHandler<context_class>::internal_manage_recycle_resource, this);
+        manage_threads->enqueue(ConnectionHandler<context_class>::internal_manage_connected_fd, this);
+        manage_threads->enqueue(ConnectionHandler<context_class>::internal_manage_recycle_resource, this);
         return true;
     }
 
 private:
-    static void internal_manage_connected_fd(KqueueConnectionHandler<context_class> *cls_instance) {
+    static void internal_manage_connected_fd(ConnectionHandler<context_class> *cls_instance) {
         while(true) {
             if (cls_instance->inited == false) {
                 return;
@@ -214,7 +215,7 @@ private:
                         close(client_fd);
                         continue;
                     }
-                    cls_instance->context_map[client_fd] = static_cast<context_class *>(cls_instance->context_memory_pool.allocate());
+                    cls_instance->context_map[client_fd] = static_cast<context_class *>(cls_instance->context_memory_pool.allocate(sizeof(context_class)));
                 } else {
                     // avoid process fd that is already in the process queue
                     if (cls_instance->occuping_fds.count(fd) == 0) {
@@ -225,7 +226,7 @@ private:
             }
         }
     }
-    static void internal_manage_recycle_resource(KqueueConnectionHandler<context_class> *cls_instance) {
+    static void internal_manage_recycle_resource(ConnectionHandler<context_class> *cls_instance) {
         while(true) {
             if (cls_instance->inited == false) {
                 return;
@@ -273,4 +274,170 @@ public:
 }; // namespace muses
 #endif
 
+#ifdef __linux__
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <sys/epoll.h>
+#include "muses/queue.hpp"
+#include "muses/thread_pool.hpp"
+#include "muses/memory_pool.hpp"
+
+namespace muses {
+
+void muses_set_nonblocking(int sockfd) {
+    int opts = fcntl(sockfd, F_GETFL);
+    if (opts < 0) {
+        exit(EXIT_FAILURE);
+    }
+    opts = (opts | O_NONBLOCK);
+    if (fcntl(sockfd, F_SETFL, opts) < 0) {
+        exit(EXIT_FAILURE);
+    }
+}
+
+template <class context_class>
+class ConnectionHandler : public BaseConnectionHandler<context_class> {
+public:
+    ConnectionHandler(int max_events, int max_threads)
+    : max_events(max_events),
+    max_threads(max_threads),
+    manage_threads(new ThreadPool(2)),
+    process_threads(new ThreadPool(max_threads)),
+    inited(false),
+    context_memory_pool(sizeof(context_class)+1, max_events) {context_memory_pool.initialize();}
+
+    ~ConnectionHandler() {
+        inited = false;
+        delete manage_threads;
+        delete process_threads;
+    }
+
+    bool init(int listen_fd, std::function<bool(context_class *, int)> process_func) {
+        if(inited) {
+            return true;
+        }
+        this->listen_fd = listen_fd;
+        this->process_func = process_func;
+
+        epoll_fd = epoll_create1(0);
+        if (epoll_fd == -1) {
+            MUSES_ERROR("Fail to create epoll.");
+            return false;
+        }
+
+        struct epoll_event listen_event{};
+        events = (new struct epoll_event[max_events]);
+        listen_event.events = EPOLLIN;
+        listen_event.data.fd = listen_fd;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &listen_event) == -1) {
+            MUSES_ERROR("Fail to add listen socket to epoll.");
+            return false;
+        } 
+
+        MUSES_INFO("Server start. Waiting for connections...");
+        inited = true;
+        manage_threads->enqueue(ConnectionHandler<context_class>::internal_manage_connected_fd, this);
+        manage_threads->enqueue(ConnectionHandler<context_class>::internal_manage_recycle_resource, this);
+        return true;
+    }
+
+private:
+    static void internal_manage_connected_fd(ConnectionHandler<context_class> *cls_instance) {
+        while(true) {
+            if (cls_instance->inited == false) {
+                return;
+            }
+            int event_count = epoll_wait(cls_instance->epoll_fd, cls_instance->events, cls_instance->max_events, -1);
+            if (event_count == -1) {
+                MUSES_ERROR("Failed to wait for events");
+                break;
+            }
+            for( int i = 0; i < event_count; i++) {
+                if(cls_instance->events[i].data.fd == cls_instance->listen_fd) {
+                    sockaddr_in client_address{};
+                    socklen_t client_address_length = sizeof(client_address);
+                    int client_fd = accept(cls_instance->events[i].data.fd, (struct sockaddr *)&client_address, &client_address_length);
+                    if(client_fd == -1) {
+                        MUSES_ERROR("Fail to accept new connection");
+                    }
+                    std::stringstream ss;
+                    ss << "New Connection from " << inet_ntoa(client_address.sin_addr);
+                    MUSES_INFO(ss.str());
+
+                    muses_set_nonblocking(client_fd);
+                    struct epoll_event client_event{};
+                    client_event.events = EPOLLIN | EPOLLET;
+                    client_event.data.fd = client_fd;
+                    if (epoll_ctl(cls_instance->epoll_fd, EPOLL_CTL_ADD, client_fd, &client_event) == -1) {
+                        MUSES_ERROR("Failed to add client socket to epoll");
+                        close(client_fd);
+                        continue;
+                    }
+                    cls_instance->context_map[client_fd] = static_cast<context_class *>(cls_instance->context_memory_pool.allocate(sizeof(context_class)));
+
+                } else {
+                    int fd = cls_instance->events[i].data.fd;
+                    if (cls_instance->occuping_fds.count(fd) == 0) {
+                        cls_instance->occuping_fds.insert(fd);
+                        cls_instance->results_queue.push(std::move(std::tuple<int, std::future<bool> >(fd, cls_instance->process_threads->enqueue(cls_instance->process_func, cls_instance->context_map[fd], fd))));
+                    }
+                }
+            }
+        }
+    }
+    static void internal_manage_recycle_resource(ConnectionHandler<context_class> *cls_instance) {
+        while(true) {
+            if (cls_instance->inited == false) {
+                return;
+            }
+
+            std::tuple<int, std::future<bool> > a_result;
+            cls_instance->results_queue.wait_and_pop(a_result);
+            if (std::get<1>(a_result).get() == false) {
+                cls_instance->context_memory_pool.deallocate(cls_instance->context_map[std::get<0>(a_result)]);
+                for(auto pos = cls_instance->context_map.begin(); pos != cls_instance->context_map.end(); pos++) {
+                    if (pos->first == std::get<0>(a_result)) {
+                        cls_instance->context_map.erase(pos);
+                        break;
+                    }
+                }
+                struct epoll_event delete_connected_event{};
+                delete_connected_event.data.fd = std::get<0>(a_result);
+                if (epoll_ctl(cls_instance->epoll_fd, EPOLL_CTL_DEL, std::get<0>(a_result), &delete_connected_event) == -1) {
+                    MUSES_ERROR("Delete kqueue event failed");
+                }
+                close(std::get<0>(a_result));
+            }
+            cls_instance->occuping_fds.erase(std::get<0>(a_result));
+        }
+    }
+
+public:
+    bool inited;
+
+    int max_events;
+    int max_threads;
+    int listen_fd;
+    int epoll_fd;
+    struct epoll_event *events;
+
+    ThreadPool *manage_threads;
+    ThreadPool *process_threads;
+
+    std::function<bool(context_class *, int)> process_func;
+    ThreadSafeQueue<std::tuple<int, std::future<bool> > > results_queue;
+    MemoryPool context_memory_pool;
+    std::set<int> occuping_fds;
+    std::map<int, context_class *> context_map;
+};
+
+
+
+
+}; // namespace muses
+
+#endif
 #endif

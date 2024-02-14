@@ -6,6 +6,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sstream>
+#include <future>
+#include "muses/profiler.hpp"
+#include "muses/thread_pool.hpp"
 
 void tcp_client(std::string ip, int port) {
     int client_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -31,9 +34,18 @@ void tcp_client(std::string ip, int port) {
     close(client_socket);
 }
 
+void thread_func(size_t id) {
+    tcp_client("127.0.0.1", 8864);
+}
+
 int main() {
-    for(int i = 0; i < 10; i++) {
-        tcp_client("127.0.0.1", 8864);
+    muses::ThreadPool pool(32);
+    std::vector<std::future<void> > results;
+    for (int i = 0; i < 1000; i++) {
+        results.emplace_back(pool.enqueue(thread_func, i));
+    }
+    for (auto&& result: results) {
+        result.get();
     }
     return 0;
 }

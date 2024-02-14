@@ -31,8 +31,8 @@ bool NullHandler(NullContext *ctx, int cfd) {
 int main() {
     muses::TCPListener listen_handler("127.0.0.1", 8864);
     std::function<bool (NullContext *, int connected_fd)> f(NullHandler);
-    muses::KqueueConnectionHandler<NullContext>  kqManager(50, 4);
-    kqManager.init(listen_handler.get_listener(), f);
+    muses::ConnectionHandler<NullContext>  Manager(50, 4);
+    Manager.init(listen_handler.get_listener(), f);
     while(true) {sleep(1);}
     return 0;
 }
