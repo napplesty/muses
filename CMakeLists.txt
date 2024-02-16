@@ -15,6 +15,7 @@ set ( MUSES_HEADERS
     muses/logging.hpp
     muses/compiler_defs.hpp
     muses/profiler.hpp
+    muses/net_components/http_handler.hpp
 )
 
 set ( MUSES_TEST_FUNCTION
@@ -33,5 +34,13 @@ set ( MUSES_TEST_NET_DRIVER_CLIENT
     tests/test_net_driver_client.cpp
 )
 
+set ( MUSES_TEST_HTTP_SERVER
+    tests/test_http_server.cpp
+)
+
+
 add_executable(muses_test_net_driver ${MUSES_TEST_NET_DRIVER})
 add_executable(muses_test_net_driver_client ${MUSES_TEST_NET_DRIVER_CLIENT})
+
+file(COPY ${CMAKE_SOURCE_DIR}/tests/statics DESTINATION ${CMAKE_BINARY_DIR})
+add_executable(muses_test_http_server ${MUSES_TEST_HTTP_SERVER})

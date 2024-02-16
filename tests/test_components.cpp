@@ -1,4 +1,5 @@
 #include "muses/compiler_defs.hpp"
+#include "muses/profiler.hpp"
 #include "muses/queue.hpp"
 #include "muses/memory_pool.hpp"
 #include "muses/thread_pool.hpp"
@@ -19,15 +20,14 @@ void thread_func(size_t id) {
 }
 
 int main() {
-
-
-    muses::ThreadPool pool(7);
+    muses::ThreadPool pool(20);
     muses::MemoryPool mp(sizeof(int)*100, 10);
     mp.initialize();
     std::cout << mp.allocate(10) << std::endl;
 
     std::vector<std::future<void> > results;
-    for (int i = 0; i < 10; i++) {
+    muses::Profiler a("test_function");
+    for (int i = 0; i < 1000; i++) {
         results.emplace_back(pool.enqueue(thread_func, i));
     }
     for (auto&& result: results) {

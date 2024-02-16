@@ -22,9 +22,6 @@
 
 #pragma once
 
-#ifndef _LOGGING_HPP
-#define _LOGGING_HPP
-
 #include <unistd.h>
 #include <iostream>
 #include <mutex>
@@ -41,6 +38,9 @@
 #include <sstream>
 #include <memory>
 #include <atomic>
+
+#ifndef _MUSES_LOGGING_HPP
+#define _MUSES_LOGGING_HPP
 
 #ifndef MUSES_LOG_LEVEL
 #define MUSES_LOG_LEVEL LogLevel::Debug

@@ -23,9 +23,6 @@
 #pragma once
 
 #include <cstdlib>
-#ifndef _NET_DRIVER_HPP
-#define _NET_DRIVER_HPP
-
 #include <string>
 #include <mutex>
 #include <iostream>
@@ -43,6 +40,9 @@
 #include <arpa/inet.h>
 
 #include "muses/logging.hpp"
+
+#ifndef _MUSES_NET_DRIVER_HPP
+#define _MUSES_NET_DRIVER_HPP
 
 namespace muses {
 
@@ -287,17 +287,6 @@ public:
 
 namespace muses {
 
-void muses_set_nonblocking(int sockfd) {
-    int opts = fcntl(sockfd, F_GETFL);
-    if (opts < 0) {
-        exit(EXIT_FAILURE);
-    }
-    opts = (opts | O_NONBLOCK);
-    if (fcntl(sockfd, F_SETFL, opts) < 0) {
-        exit(EXIT_FAILURE);
-    }
-}
-
 template <class context_class>
 class ConnectionHandler : public BaseConnectionHandler<context_class> {
 public:
@@ -307,12 +296,23 @@ public:
     manage_threads(new ThreadPool(2)),
     process_threads(new ThreadPool(max_threads)),
     inited(false),
-    context_memory_pool(sizeof(context_class)+1, max_events) {context_memory_pool.initialize();}
+    context_memory_pool(4096, max_events) {context_memory_pool.initialize();}
 
     ~ConnectionHandler() {
         inited = false;
         delete manage_threads;
         delete process_threads;
+    }
+
+    static void muses_set_nonblocking(int sockfd) {
+        int opts = fcntl(sockfd, F_GETFL);
+        if (opts < 0) {
+            exit(EXIT_FAILURE);
+        }
+        opts = (opts | O_NONBLOCK);
+        if (fcntl(sockfd, F_SETFL, opts) < 0) {
+            exit(EXIT_FAILURE);
+        }
     }
 
     bool init(int listen_fd, std::function<bool(context_class *, int)> process_func) {
@@ -388,6 +388,7 @@ private:
             }
         }
     }
+    
     static void internal_manage_recycle_resource(ConnectionHandler<context_class> *cls_instance) {
         while(true) {
             if (cls_instance->inited == false) {

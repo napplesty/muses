@@ -22,15 +22,15 @@
 
 #pragma once
 
-#ifndef _QUEUE_HPP
-#define _QUEUE_HPP
-
 #include <functional>
 #include <queue>
 #include <memory>
 #include <mutex>
 #include <condition_variable>
 #include <limits>
+
+#ifndef _MUSES_QUEUE_HPP
+#define _MUSES_QUEUE_HPP
 
 namespace muses {
 

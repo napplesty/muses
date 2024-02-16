@@ -27,8 +27,8 @@
 #include <string>
 #include "muses/logging.hpp"
 
-#ifndef MUSES_PROFILER_HPP
-#define MUSES_PROFILER_HPP
+#ifndef _MUSES_PROFILER_HPP
+#define _MUSES_PROFILER_HPP
 
 namespace muses {
 

@@ -22,12 +22,12 @@
 
 #pragma once
 
-#ifndef _MUSES_MEMORY_POOL_HPP
-#define _MUSES_MEMORY_POOL_HPP
-
 #include <mutex>
 #include "muses/compiler_defs.hpp"
 #include "muses/logging.hpp"
+
+#ifndef _MUSES_MEMORY_POOL_HPP
+#define _MUSES_MEMORY_POOL_HPP
 
 namespace muses {
 
