@@ -232,24 +232,25 @@ private:
                 return;
             }
 
-            std::tuple<int, std::future<bool> > a_result;
+            std::tuple<int, std::future<bool>> a_result;
             cls_instance->results_queue.wait_and_pop(a_result);
-            if (std::get<1>(a_result).get() == false) {
-                cls_instance->context_memory_pool.deallocate(cls_instance->context_map[std::get<0>(a_result)]);
-                for(auto pos = cls_instance->context_map.begin(); pos != cls_instance->context_map.end(); pos++) {
-                    if (pos->first == std::get<0>(a_result)) {
-                        cls_instance->context_map.erase(pos);
-                        break;
-                    }
-                }
+            bool should_close = std::get<1>(a_result).get();
+
+            int fd = std::get<0>(a_result);
+
+            if (should_close) {
+                cls_instance->context_memory_pool.deallocate(cls_instance->context_map[fd]);
+                cls_instance->context_map.erase(fd);
+
                 struct kevent delete_connected_event{};
-                EV_SET(&delete_connected_event, std::get<0>(a_result), EVFILT_READ, EV_DELETE, 0, 0, nullptr);
-                if (kevent(cls_instance->kqueue_fd, &delete_connected_event, 1, cls_instance->events, 1, 0) == -1) {
+                EV_SET(&delete_connected_event, fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+                if (kevent(cls_instance->kqueue_fd, &delete_connected_event, 1, nullptr, 0, 0) == -1) {
                     MUSES_ERROR("Delete kqueue event failed");
                 }
-                close(std::get<0>(a_result));
+                close(fd);
             }
-            cls_instance->occuping_fds.erase(std::get<0>(a_result));
+
+            cls_instance->occuping_fds.erase(fd);
         }
     }
 

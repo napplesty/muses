@@ -30,6 +30,7 @@
 #include <sstream>
 #include <map>
 #include <filesystem>
+#include <fstream>
 #include "muses/logging.hpp"
 
 
@@ -53,21 +54,26 @@ public:
 
     static HttpInfo parse_request(int client_fd) {
         HttpInfo http_info;
-        char buffer[BUFFER_SIZE*4];
+        char buffer[BUFFER_SIZE];
         std::string request;
+        const size_t MAX_REQUEST_SIZE = BUFFER_SIZE * 8;
         int bytes_read;
+
         while ((bytes_read = read(client_fd, buffer, BUFFER_SIZE - 1)) > 0) {
             buffer[bytes_read] = '\0';
-            request += buffer;
-            if (request.find("\n") != std::string::npos) {
+            request.append(buffer, bytes_read);
+            if (request.find("\r\n\r\n") != std::string::npos) {
                 break;
             }
-            
+            if (request.size() > MAX_REQUEST_SIZE) {
+                break;
+            }
         }
+
         std::istringstream request_stream(request);
         std::getline(request_stream, http_info.method, ' ');
         std::getline(request_stream, http_info.url, ' ');
-        std::getline(request_stream, http_info.version, '\n');
+        std::getline(request_stream, http_info.version, '\r');
         std::string header_line;
         while (std::getline(request_stream, header_line) && header_line != "\r") {
             size_t delimiter_pos = header_line.find(": ");
@@ -77,87 +83,156 @@ public:
                 http_info.headers[key] = value;
             }
         }
-        http_info.body = std::string(buffer + request_stream.tellg(), request.size() - request_stream.tellg());
+
         return http_info;
     }
 
     static std::string read_file(const std::string& file_path) {
         std::ifstream file(file_path);
+        if (!file.is_open()) {
+            return "";
+        }
         std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         return content;
     }
 
     static ssize_t get_file_size(const std::string &filename) {
         std::ifstream file(filename, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            return -1;
+        }
         return file.tellg();
     }
 
-    static std::string send_response(const HttpInfo &http_info, int socket_fd) {
-        std::stringstream ss;
-        ss << "HTTP/1.1 200 OK" << std::endl;
-        ss << "Content-Type: text/html; charset=utf-8" << std::endl;
-        ss << "Connection: close" << std::endl;
-        if(http_info.url == "/"){
-            ss << "Content-Length: " << get_file_size("./statics/index.html") << std::endl;
-            ss << std::endl;
-            ss << read_file("./statics/index.html") << std::endl;
-        } else {
-            ss << "Content-Length: " << get_file_size("./statics" + http_info.url) << std::endl;
-            ss << std::endl;
-            ss << read_file("./statics" + http_info.url) << std::endl;
+    static std::string get_content_type(const std::string& file_path) {
+        size_t dot_pos = file_path.find_last_of('.');
+        if (dot_pos == std::string::npos) {
+            return "application/octet-stream";
         }
-        std::string response = ss.str();
-        return response;
+        std::string ext = file_path.substr(dot_pos);
+        if (ext == ".html" || ext == ".htm") return "text/html; charset=utf-8";
+        if (ext == ".css") return "text/css; charset=utf-8";
+        if (ext == ".js") return "application/javascript; charset=utf-8";
+        if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+        if (ext == ".png") return "image/png";
+        if (ext == ".gif") return "image/gif";
+        if (ext == ".svg") return "image/svg+xml";
+        if (ext == ".json") return "application/json";
+        if (ext == ".txt") return "text/plain; charset=utf-8";
+        return "application/octet-stream";
+    }
+
+    static std::string send_response(const std::string& file_path) {
+        std::string content = read_file(file_path);
+        std::stringstream ss;
+
+        if (content.empty()) {
+            ss << "HTTP/1.1 500 Internal Server Error" << std::endl;
+            ss << "Content-Type: text/plain" << std::endl;
+            ss << "Connection: close" << std::endl;
+            ss << "Content-Length: 13" << std::endl;
+            ss << std::endl;
+            ss << "500 Error" << std::endl;
+            return ss.str();
+        }
+
+        ss << "HTTP/1.1 200 OK" << std::endl;
+        ss << "Content-Type: " << get_content_type(file_path) << std::endl;
+        ss << "Connection: close" << std::endl;
+        ss << "Content-Length: " << content.size() << std::endl;
+        ss << std::endl;
+        ss << content;
+        return ss.str();
     }
 
     static std::string send_404_response(const HttpInfo &http_info, int socket_fd) {
+        std::string content = read_file("./statics/404.html");
         std::stringstream ss;
         ss << "HTTP/1.1 404 Not Found" << std::endl;
         ss << "Content-Type: text/html; charset=utf-8" << std::endl;
         ss << "Connection: close" << std::endl;
-        ss << "Content-Length: " << get_file_size("./statics/404.html") << std::endl;
-        ss << std::endl;
-
-        ss << read_file("./statics/404.html") << std::endl;
-        std::string response = ss.str();
-        return response;
+        if (content.empty()) {
+            ss << "Content-Length: 9" << std::endl;
+            ss << std::endl;
+            ss << "404 Error";
+        } else {
+            ss << "Content-Length: " << content.size() << std::endl;
+            ss << std::endl;
+            ss << content;
+        }
+        return ss.str();
     }
 
     static std::string send_405_response(const HttpInfo &http_info, int socket_fd) {
+        std::string content = read_file("./statics/405.html");
         std::stringstream ss;
         ss << "HTTP/1.1 405 Method Not Allowed" << std::endl;
         ss << "Content-Type: text/html; charset=utf-8" << std::endl;
         ss << "Connection: close" << std::endl;
-        ss << "Content-Length: " << get_file_size("./statics/405.html") << std::endl;
-        ss << std::endl;
-
-        ss << read_file("./statics/405.html") << std::endl;
-        std::string response = ss.str();
-        return response;
+        if (content.empty()) {
+            ss << "Content-Length: 9" << std::endl;
+            ss << std::endl;
+            ss << "405 Error";
+        } else {
+            ss << "Content-Length: " << content.size() << std::endl;
+            ss << std::endl;
+            ss << content;
+        }
+        return ss.str();
     }
 
     static bool handle_request(int socket_fd) {
         HttpInfo http_info = parse_request(socket_fd);
         std::string response;
-        bool ret = true;
 
-        if (http_info.method == "GET") {
-            std::string file_path = "./statics" + http_info.url.substr(http_info.url.find('/') + 1);
-            if (std::filesystem::exists(file_path)) {
-                response = send_response(http_info, socket_fd);
-                ret = false;
-            } else {
-                response = send_404_response(http_info, socket_fd);
-                ret = true;
-                MUSES_INFO(std::string("404: request:") + http_info.url);
-            }
-        } else {
+        MUSES_INFO(std::string("Request: ") + http_info.method + " " + http_info.url);
+
+        if (http_info.method != "GET") {
             response = send_405_response(http_info, socket_fd);
-            ret = true;
-            MUSES_INFO(std::string("405: method:") + http_info.method);
+            MUSES_INFO(std::string("Response: 405"));
+        } else {
+            std::string file_path = "./statics" + http_info.url;
+
+            if (http_info.url == "/") {
+                file_path = "./statics/index.html";
+            }
+
+            std::string normalized_path;
+            try {
+                normalized_path = std::filesystem::canonical(file_path);
+                std::string statics_path = std::filesystem::canonical("./statics");
+
+                if (normalized_path.find(statics_path) != 0) {
+                    response = send_404_response(http_info, socket_fd);
+                    MUSES_INFO(std::string("Response: 404 (path traversal blocked)"));
+                } else if (std::filesystem::exists(file_path)) {
+                    response = send_response(file_path);
+                    MUSES_INFO(std::string("Response: 200"));
+                } else {
+                    response = send_404_response(http_info, socket_fd);
+                    MUSES_INFO(std::string("Response: 404"));
+                }
+            } catch (const std::exception& e) {
+                response = send_404_response(http_info, socket_fd);
+                MUSES_INFO(std::string("Response: 404 (filesystem error)"));
+            }
         }
-        send(socket_fd, response.c_str(), response.size(), 0);
-        return ret;
+
+        size_t total_sent = 0;
+        size_t response_size = response.size();
+        while (total_sent < response_size) {
+            ssize_t sent = send(socket_fd, response.c_str() + total_sent,
+                               response_size - total_sent, 0);
+            if (sent < 0) {
+                break;
+            }
+            if (sent == 0) {
+                break;
+            }
+            total_sent += sent;
+        }
+
+        return true;
     }
 };
 

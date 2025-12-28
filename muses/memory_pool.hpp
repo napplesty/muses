@@ -138,7 +138,7 @@ public:
 private:
     inline bool check_allocatable(size_t size, int block_idx) {
         size_t allocate_size = size + sizeof(buffer_info_t::length);
-        return block_size - memory_pool->offset >= allocate_size;
+        return block_size - memory_pool[block_idx].offset >= allocate_size;
     }
 
     inline void allocatable_step() {
