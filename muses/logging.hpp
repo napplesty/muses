@@ -22,32 +22,30 @@
 
 #pragma once
 
-#include <unistd.h>
-#include <iostream>
-#include <mutex>
-#include <fstream>
-#include <condition_variable>
-#include <thread>
-#include <muses/queue.hpp>
-#include <ctime>
-#include <chrono>
-#include <functional>
-#include <string>
-#include <tuple>
-#include <cstring>
-#include <sstream>
-#include <memory>
 #include <atomic>
+#include <chrono>
+#include <ctime>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <tuple>
 
-#ifndef _MUSES_LOGGING_HPP
-#define _MUSES_LOGGING_HPP
+#include "muses/bounded_queue.hpp"
+
+#ifndef MUSES_LOGGING_HPP
+#define MUSES_LOGGING_HPP
 
 #ifndef MUSES_LOG_LEVEL
-#define MUSES_LOG_LEVEL LogLevel::Debug
+    #define MUSES_LOG_LEVEL ::muses::LogLevel::Debug
 #endif
 
 #ifndef MUSES_LOG_FILENAME
-#define MUSES_LOG_FILENAME "log.txt"
+    #define MUSES_LOG_FILENAME "log.txt"
+#endif
+
+#ifndef MUSES_LOG_CAPACITY
+    #define MUSES_LOG_CAPACITY 4096
 #endif
 
 namespace muses {
@@ -60,96 +58,173 @@ enum class LogLevel {
     Fatal
 };
 
+// Asynchronous logger backed by a bounded MPMC ring (DropOldest so producers
+// on the hot path are never blocked). A single background thread drains the
+// queue in batches and writes to file.
+//
+// The old logger deadlocked because its consumer called wait_and_pop() in a
+// loop whose predicate checked empty() first; once empty, the pop blocked
+// forever and the destructor's join hung. Here the consumer uses
+// wait_pop(timeout) and the destructor calls stop() to guarantee the waiter
+// unblocks.
 class Logger {
-private:
-    Logger(LogLevel level, std::string log_filename)
-    : level(level), is_running(true), 
-    write_buffer(), log_filename(log_filename),
-    thread(&Logger::write_to) {}
-
-    ~Logger() {
-        {
-            is_running = false;
-        }
-        thread.join();
-    }
-
-    std::string get_level_string(LogLevel level) {
-        if(level == LogLevel::Debug) {
-            return "Debug";
-        } else if (level == LogLevel::Info) {
-            return "Info";
-        } else if (level == LogLevel::Warning) {
-            return "Warning";
-        } else if (level == LogLevel::Error) {
-            return "Error";
-        } else {
-            return "Fatal";
-        }
-    }
-
-    static void write_to() {
-        Logger* logger = Logger::get_instance();
-        while (true) { 
-            usleep(10000);
-            {
-                std::stringstream ss;
-                while(!logger->msg_queue.empty()) {
-                    std::tuple<LogLevel, std::string, std::string, std::time_t> msg;
-                    logger->msg_queue.wait_and_pop(msg);
-                    char time_string[50];
-                    memset(time_string, '\0', sizeof(time_string));
-                    std::strftime(time_string, sizeof(time_string), "%Y-%m-%d %H:%M:%S", std::localtime(&std::get<3>(msg)));
-                    std::string time_str(time_string);
-                    std::string level_str = logger->get_level_string(std::get<0>(msg));
-                    ss << '[' << level_str << "] " << time_string << ' ' << std::get<1>(msg) << ": " << std::get<2>(msg) << std::endl;
-                }
-                logger->write_buffer += ss.str();
-                ss.str("");
-            }
-            if(logger->write_buffer.size() >= 128 || !logger->is_running) {
-                std::ofstream file(logger->log_filename, std::ios::out|std::ios::app);
-                file << logger->write_buffer;
-                file.close();
-                logger->write_buffer.clear();
-            }
-            if(!logger->is_running) {
-                break;
-            }
-        }
-    }
-
 public:
+    using Entry = std::tuple<LogLevel, std::string, std::string, std::time_t>;
+
     static Logger* get_instance() {
-        static Logger logger(MUSES_LOG_LEVEL, MUSES_LOG_FILENAME);
-        return &logger;
+        static Logger instance(MUSES_LOG_LEVEL, MUSES_LOG_FILENAME, MUSES_LOG_CAPACITY);
+        return &instance;
     }
+
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
 
-    void log(LogLevel level, const std::string message, const std::string &func_name) {
-        if (level < this->level) {
+    void log(LogLevel level, const std::string& message, const std::string& func_name) {
+        if (level < level_.load(std::memory_order_relaxed)) {
             return;
-        } else {
-            std::time_t timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-            msg_queue.push(std::make_tuple(level, func_name, message, timestamp));
+        }
+        std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        queue_.push(Entry{level, func_name, message, now});
+    }
+
+    // Block until all currently-queued entries are flushed to disk. Mainly
+    // for tests; not for the hot path. Forces a write regardless of the
+    // batching threshold.
+    void flush() {
+        // Drain anything still queued into the in-memory buffer.
+        Entry e;
+        while (queue_.try_pop(e)) {
+            std::lock_guard<std::mutex> lock(line_mu_);
+            buffer_ += format(e);
+        }
+        // Force the buffer to disk regardless of size.
+        std::string to_write;
+        {
+            std::lock_guard<std::mutex> lock(line_mu_);
+            to_write.swap(buffer_);
+        }
+        if (!to_write.empty()) {
+            std::ofstream file(filename_, std::ios::out | std::ios::app);
+            if (file.is_open()) {
+                file << to_write;
+            }
         }
     }
 
+    std::size_t dropped() const { return queue_.dropped(); }
+
 private:
-    std::string write_buffer;
-    std::thread thread;
-    std::string log_filename;
-    std::atomic<bool> is_running;
-    LogLevel level;
-    ThreadSafeQueue<std::tuple<LogLevel, std::string, std::string, std::time_t> > msg_queue;
-};
+    Logger(LogLevel level, const std::string& filename, std::size_t capacity)
+    : level_(level),
+      filename_(filename),
+      queue_(capacity, OverflowPolicy::DropOldest),
+      running_(true),
+      thread_(&Logger::writer_loop, this) {}
+
+    ~Logger() {
+        running_.store(false, std::memory_order_release);
+        queue_.stop();
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        // Final drain so nothing is lost on shutdown.
+        write_all();
+    }
+
+    static const char* level_string(LogLevel l) {
+        switch (l) {
+            case LogLevel::Debug:   return "Debug";
+            case LogLevel::Info:    return "Info";
+            case LogLevel::Warning: return "Warning";
+            case LogLevel::Error:   return "Error";
+            case LogLevel::Fatal:   return "Fatal";
+        }
+        return "Unknown";
+    }
+
+    void writer_loop() {
+        while (running_.load(std::memory_order_acquire) || queue_.size() > 0) {
+            write_all();
+            // Throttle: wake every 50ms to drain, or immediately on new data.
+            Entry e;
+            if (queue_.wait_pop(e, std::chrono::milliseconds(50))) {
+                std::lock_guard<std::mutex> lock(line_mu_);
+                buffer_ += format(e);
+                // Re-inject: batch what else is immediately available.
+                Entry more;
+                while (queue_.try_pop(more)) {
+                    buffer_ += format(more);
+                }
+            }
+            flush_buffer_if_needed();
+            {
+                std::lock_guard<std::mutex> flk(flush_mu_);
+                flush_cv_.notify_all();
+            }
+        }
+        flush_buffer_if_needed();
+    }
+
+    void write_all() {
+        Entry e;
+        {
+            std::lock_guard<std::mutex> lock(line_mu_);
+            while (queue_.try_pop(e)) {
+                buffer_ += format(e);
+            }
+        }
+        flush_buffer_if_needed();
+    }
+
+    static std::string format(const Entry& e) {
+        char time_buf[64];
+        std::tm tm_local{};
+        std::time_t t = std::get<3>(e);
+        localtime_r(&t, &tm_local);
+        std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_local);
+
+        std::ostringstream ss;
+        ss << '[' << level_string(std::get<0>(e)) << "] "
+           << time_buf << ' '
+           << std::get<1>(e) << ": "
+           << std::get<2>(e) << '\n';
+        return ss.str();
+    }
+
+    void flush_buffer_if_needed() {
+        std::string to_write;
+        {
+            std::lock_guard<std::mutex> lock(line_mu_);
+            if (buffer_.empty()) return;
+            constexpr std::size_t kFlushThreshold = 128;
+            if (buffer_.size() < kFlushThreshold && running_.load(std::memory_order_relaxed)) {
+                return;
+            }
+            to_write.swap(buffer_);
+        }
+        std::ofstream file(filename_, std::ios::out | std::ios::app);
+        if (file.is_open()) {
+            file << to_write;
+        }
+    }
+
+    std::atomic<LogLevel> level_;
+    std::string filename_;
+    BoundedQueue<Entry> queue_;
+    std::atomic<bool> running_;
+    std::thread thread_;
+    std::string buffer_;
+    mutable std::mutex line_mu_;
+    mutable std::mutex flush_mu_;
+    std::condition_variable flush_cv_;
 };
 
-#define MUSES_DEBUG(msg) muses::Logger::get_instance()->log(muses::LogLevel::Debug,msg,__func__)
-#define MUSES_INFO(msg) muses::Logger::get_instance()->log(muses::LogLevel::Info,msg,__func__)
-#define MUSES_WARNING(msg) muses::Logger::get_instance()->log(muses::LogLevel::Warning,msg,__func__)
-#define MUSES_ERROR(msg) muses::Logger::get_instance()->log(muses::LogLevel::Error,msg,__func__)
-#define MUSES_FATAL(msg) muses::Logger::get_instance()->log(muses::LogLevel::Fatal,msg,__func__)
+}  // namespace muses
 
-#endif
+#define MUSES_DEBUG(msg)   ::muses::Logger::get_instance()->log(::muses::LogLevel::Debug,   (msg), __func__)
+#define MUSES_INFO(msg)    ::muses::Logger::get_instance()->log(::muses::LogLevel::Info,    (msg), __func__)
+#define MUSES_WARNING(msg) ::muses::Logger::get_instance()->log(::muses::LogLevel::Warning, (msg), __func__)
+#define MUSES_ERROR(msg)   ::muses::Logger::get_instance()->log(::muses::LogLevel::Error,   (msg), __func__)
+#define MUSES_FATAL(msg)   ::muses::Logger::get_instance()->log(::muses::LogLevel::Fatal,   (msg), __func__)
+
+#endif  // MUSES_LOGGING_HPP
