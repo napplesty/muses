@@ -1,89 +1,116 @@
-# Muses Project
+# Muses
 
-## Introduction
+A header-only C++20 collection of concurrency and networking primitives:
+a thread pool, a size-classed memory pool with per-allocation reference
+counting, a bounded MPMC queue, an asynchronous logger, and a reactor-based
+HTTP server (kqueue on macOS, epoll on Linux).
 
-Muses Project is a c++ header-only library for many useful cmponents.
+This is a learning/portfolio project. The components are independently tested
+under AddressSanitizer + UBSan.
 
+## Status
 
-## How to use
-You can check the codes under the tests folder to find out the usage of this library.
+| Component        | Header                                   | Notes                                            |
+|------------------|------------------------------------------|--------------------------------------------------|
+| Thread pool      | `muses/thread_pool.hpp`                  | fixed-size, futures, `wait_empty()`              |
+| Memory pool      | `muses/memory_pool.hpp`                  | size-class free-lists + per-alloc refcount + `PoolPtr<T>` |
+| Bounded queue    | `muses/bounded_queue.hpp`                | MPMC, DropNew / DropOldest / Block               |
+| (unbounded queue)| `muses/queue.hpp`                        | blocking push/pop, retained for general use      |
+| Logger           | `muses/logging.hpp`                      | async, single background thread, DropOldest ring |
+| Profiler         | `muses/profiler.hpp`                     | RAII scope timer                                 |
+| Poller           | `muses/net/poller.hpp` + `*_poller.hpp`  | kqueue/epoll abstraction + wakeup                |
+| Reactor          | `muses/net/reactor.hpp`                  | single I/O thread + blocking worker pool          |
+| HTTP handler     | `muses/net_components/http_handler.hpp`  | static files, CRLF, keep-alive, traversal-safe   |
 
-## Components
+## Build
 
-**Logging**
+Requires CMake >= 3.18 and a C++20 compiler (clang >= 14 / gcc >= 11).
 
-muses contains a logging module to correctly log when multithreading.
+```bash
+cmake -S . -B build
+cmake --build build -j
+```
 
-**Memory Pool**
+Debug builds enable AddressSanitizer + UndefinedBehaviorSanitizer by default.
+Disable with `-DMUSES_ENABLE_SANITIZERS=OFF`.
 
-muses implements a memory pool to efficiently allocate the memory for the function in the muses
+## Tests
 
-**Queue**
+Tests use [doctest](https://github.com/doctest/doctest), fetched via
+`FetchContent` (no manual install). Each `tests/test_*.cpp` is a standalone
+executable registered with CTest.
 
-muses implements a thread safe queue to make all call in the muses async
+```bash
+cd build && ctest --output-on-failure
+```
 
-**Thread Pool**
+The reactor and poller tests bind real sockets on `127.0.0.1` ephemeral ports.
 
-muses implements a easy thread pool to multithread.
+## Example server
 
-**Net Driver**
+```bash
+cd build && ./muses_http_server
+# serves ./statics on http://127.0.0.1:8864/
+```
 
-muses implements a simplest server to show how to use muses library.
+```cpp
+#include "muses/net/reactor.hpp"
+#include "muses/net_components/http_handler.hpp"
 
-## ROADMAP
+muses::TCPListener listener("127.0.0.1", 8864);
+muses::Reactor reactor(listener.get_listener(),
+    [](const std::string& req) -> muses::HandlerResult {
+        auto hr = muses::HttpContext::handle_request(req);
+        return {std::move(hr.response), hr.keep_alive};
+    }, /*worker_threads=*/4);
+reactor.start();
+```
 
-### December 29, 2025 - HTTP Server Stability Improvements
+## Architecture notes
 
-**Fixed Issues:**
+**Memory pool** (`memory_pool.hpp`): every allocation is prefixed with a
+`BlockHeader` carrying a magic cookie, the owning size-class index, and an
+atomic reference count. Allocations are served from per-class free-lists
+backed by a pre-allocated arena; oversized requests fall back to
+`::operator new` and are tagged `ESCAPED` so `release()` routes them back via
+`::operator delete`. `PoolPtr<T>` is the RAII handle (copy = retain, move =
+transfer, destroy = release). This replaces the old bump-allocator whose
+per-block "refcount" was actually an allocation counter and recycled blocks
+while still referenced.
 
-1. **MemoryPool Critical Bug Fix** (muses/memory_pool.hpp:141)
-   - Fixed `check_allocatable` function using incorrect block index
-   - Original issue: Used `memory_pool->offset` instead of `memory_pool[block_idx].offset`
-   - Impact: Caused memory allocation errors and server crashes
+**Logger** (`logging.hpp`): producers push entries into a bounded MPMC ring
+(`DropOldest`, so the hot path is never blocked). A single background thread
+drains in batches and writes to file. The consumer uses `wait_pop(timeout)`
+and the destructor calls `stop()` — this fixes the old logger, which deadlocked
+because its consumer called `wait_and_pop()` in a loop that blocked forever
+once the queue emptied.
 
-2. **Network Driver Resource Management Optimization** (muses/net_driver.hpp:229-255)
-   - Optimized connection resource management logic
-   - Fixed kevent call parameter errors
-   - Improved fd management using direct `erase(key)` instead of loop search
-   - Unified connection lifecycle management
+**Reactor** (`net/reactor.hpp`): one dedicated I/O thread runs the poller,
+accepts connections, and reads requests. A complete request is handed to a
+`ThreadPool` worker (the fd is detached from the poller while in flight), the
+worker computes the response and does the blocking write, then hands back
+`{fd, keep_alive, ok}` through a bounded outbox — the *only* shared mutable
+channel between threads. The reactor drains the outbox and either re-arms the
+fd (keep-alive) or closes it. Connection state lives in a reactor-thread-only
+map, eliminating the old `net_driver`'s data races on `context_map` /
+`occuping_fds`.
 
-3. **HTTP Handler Enhancements** (muses/net_components/http_handler.hpp)
-   - Fixed HTTP request parsing using `\r\n\r\n` as termination marker
-   - Added path traversal attack protection
-   - Implemented proper Content-Type detection
-   - Added comprehensive error handling
-   - Implemented partial send handling mechanism
-   - Added request logging
+**Poller** (`net/poller.hpp`): `EventMask` bit flags + `PollEvent{fd,mask,userdata}`
+abstract kqueue/epoll. `wakeup()` (EVFILT_USER on macOS, eventfd on Linux) lets
+another thread interrupt a blocked `wait()`.
 
-**Test Results:**
-- Consecutive 800+ requests test success rate: 100%
-- Locust stress test (20 users, 30s): 7,292 requests, 100% success
-- Throughput: 245+ req/s
-- Average response time: 1ms
-- Server stability: Zero crashes, zero memory leaks
+## Known limitations
 
-### Future Plans
+- HTTP/1.1 only; no HTTPS, WebSocket, HTTP/2, routing, or middleware.
+- No pipelined-request handling: a second request received in the same read as
+  the first is dropped (the reactor dispatches on the first `\r\n\r\n`).
+- `write_all` busy-spins on EAGAIN, which is fine for small responses but would
+  block a worker on a slow client with a full socket buffer; large responses
+  should register writable interest instead (not yet implemented).
+- Logger is a process-wide singleton; the log filename/level are compile-time
+  macros.
+- Windows / IOCP is not supported.
 
-**Short-term Goals (Q1 2026):**
-- [ ] Add HTTP Keep-Alive support
-- [ ] Implement request timeout mechanism
-- [ ] Add static file caching
-- [ ] Support Range requests (large file chunked transfer)
-- [ ] Implement POST request handling
-- [ ] Add HTTPS support
+## License
 
-**Mid-term Goals (Q2-Q3 2026):**
-- [ ] Implement WebSocket support
-- [ ] Add request routing system
-- [ ] Implement middleware mechanism
-- [ ] Add rate limiting functionality
-- [ ] Implement connection pooling
-- [ ] Add compression transfer support
-
-**Long-term Goals (Q4 2026+):**
-- [ ] Implement HTTP/2 support
-- [ ] Add configuration file support
-- [ ] Implement hot reload
-- [ ] Add performance monitoring and profiling
-- [ ] Implement load balancing
-- [ ] Add comprehensive test coverage
+MIT.
