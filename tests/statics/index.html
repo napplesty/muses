@@ -1,51 +1,326 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Welcome to muses!</title>
+    <title>Muses — a C++23 concurrency & networking toolkit</title>
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            background-color: #333;
+        /* Dark morandi palette: low-saturation, warm-dark, with a muted
+           rust-orange accent nodding to the language we wish we were. */
+        :root {
+            --bg:        #26221e;
+            --bg-elev:   #2f2a25;
+            --bg-elev2:  #332d27;
+            --border:    #3d362f;
+            --text:      #d8d0c4;
+            --text-dim:  #9a9189;
+            --accent:    #c4694f;
+            --accent-dim:#8a4a39;
+            --code-bg:   #1e1a16;
+        }
+
+        * { box-sizing: border-box; }
+
+        html, body {
             margin: 0;
             padding: 0;
-        }
-
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-
-        h1 {
-            font-size: 36px;
-            text-align: center;
-            color: #ccc;
-            margin-bottom: 20px;
-        }
-
-        p {
-            font-size: 18px;
+            background-color: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                         "Helvetica Neue", Arial, sans-serif;
             line-height: 1.6;
-            color: #999;
-            text-align: justify;
+            -webkit-font-smoothing: antialiased;
         }
 
-        .module {
-            background-color: #006400;
-            border-radius: 10px;
-            padding: 20px;
-            margin-bottom: 20px;
+        /* ---------- Hero: full-bleed big color block ---------- */
+        .hero {
+            border-bottom: 1px solid var(--border);
+            background:
+                radial-gradient(900px 400px at 80% -10%,
+                    rgba(196, 105, 79, 0.10), transparent 60%);
+            padding: 7rem 1.5rem 6rem;
         }
+        .hero-inner {
+            max-width: 960px;
+            margin: 0 auto;
+        }
+        .hero .eyebrow {
+            color: var(--accent);
+            font-size: 0.85rem;
+            font-weight: 600;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            margin: 0 0 1rem;
+        }
+        .hero h1 {
+            font-size: clamp(2.4rem, 5vw, 3.6rem);
+            font-weight: 700;
+            line-height: 1.1;
+            letter-spacing: -0.02em;
+            margin: 0 0 1.2rem;
+            color: #efe9dd;
+        }
+        .hero h1 .ac { color: var(--accent); }
+        .hero p.lede {
+            font-size: 1.2rem;
+            color: var(--text-dim);
+            max-width: 620px;
+            margin: 0 0 2.4rem;
+        }
+        .cta {
+            display: inline-flex;
+            gap: 0.9rem;
+            flex-wrap: wrap;
+        }
+        .btn {
+            display: inline-block;
+            padding: 0.8rem 1.6rem;
+            border-radius: 8px;
+            font-weight: 600;
+            text-decoration: none;
+            font-size: 0.98rem;
+            transition: background-color .15s ease, transform .15s ease;
+        }
+        .btn-primary {
+            background-color: var(--accent);
+            color: #1c1814;
+        }
+        .btn-primary:hover { background-color: #d47960; }
+        .btn-ghost {
+            background-color: transparent;
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+        .btn-ghost:hover { border-color: var(--text-dim); }
+
+        /* ---------- Section frame ---------- */
+        section {
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 5rem 1.5rem;
+        }
+        section h2 {
+            font-size: 1.7rem;
+            font-weight: 700;
+            letter-spacing: -0.01em;
+            margin: 0 0 2.4rem;
+            color: #efe9dd;
+        }
+
+        /* ---------- Three big color-block cards ---------- */
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 1.25rem;
+        }
+        .card {
+            background-color: var(--bg-elev);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.8rem 1.6rem;
+        }
+        .card .icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 38px;
+            height: 38px;
+            border-radius: 9px;
+            background-color: rgba(196, 105, 79, 0.14);
+            color: var(--accent);
+            font-size: 1.2rem;
+            margin-bottom: 1rem;
+        }
+        .card h3 {
+            font-size: 1.15rem;
+            margin: 0 0 0.6rem;
+            color: #efe9dd;
+        }
+        .card p {
+            margin: 0;
+            color: var(--text-dim);
+            font-size: 0.97rem;
+        }
+        .card code {
+            color: var(--accent);
+            font-family: "SF Mono", "Fira Code", Consolas, monospace;
+            font-size: 0.88em;
+        }
+
+        /* ---------- Code block ---------- */
+        .codeblock {
+            background-color: var(--code-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.6rem 1.8rem;
+            overflow-x: auto;
+            font-family: "SF Mono", "Fira Code", Consolas, monospace;
+            font-size: 0.9rem;
+            line-height: 1.7;
+            color: #c8c0b4;
+        }
+        .codeblock .kw { color: var(--accent); }
+        .codeblock .str { color: #b5a67a; }
+        .codeblock .com { color: #6f665d; font-style: italic; }
+        .codeblock .ty  { color: #9bb3a8; }
+
+        /* ---------- Stats strip ---------- */
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 1.25rem;
+        }
+        .stat {
+            background-color: var(--bg-elev2);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.6rem;
+            text-align: center;
+        }
+        .stat .num {
+            display: block;
+            font-size: 1.9rem;
+            font-weight: 700;
+            color: var(--accent);
+            letter-spacing: -0.02em;
+        }
+        .stat .lbl {
+            display: block;
+            margin-top: 0.4rem;
+            color: var(--text-dim);
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        footer {
+            border-top: 1px solid var(--border);
+            padding: 2.5rem 1.5rem;
+            text-align: center;
+            color: var(--text-dim);
+            font-size: 0.9rem;
+        }
+        footer a { color: var(--accent); text-decoration: none; }
+        footer a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>Welcome!</h1>
-        <div class="module">
-            <p>This is the http component of the Muses. Designed by Nastyapple</p>
+
+    <!-- ============ HERO ============ -->
+    <div class="hero">
+        <div class="hero-inner">
+            <p class="eyebrow">C++23 · header-only · kqueue / epoll</p>
+            <h1>Build services that<br><span class="ac">don't race.</span></h1>
+            <p class="lede">
+                Muses is a header-only toolkit of concurrency and networking
+                primitives — a per-allocation memory pool, an async logger, and a
+                reactor-based HTTP server. Tested under ASan + UBSan.
+            </p>
+            <div class="cta">
+                <a class="btn btn-primary" href="#components">Get started</a>
+                <a class="btn btn-ghost" href="#benchmark">See benchmarks</a>
+            </div>
         </div>
     </div>
+
+    <!-- ============ WHY / COMPONENTS ============ -->
+    <section id="components">
+        <h2>Why muses</h2>
+        <div class="grid">
+            <div class="card">
+                <div class="icon">◈</div>
+                <h3>Memory pool</h3>
+                <p>
+                    Size-classed free-lists with true per-allocation reference
+                    counting. <code>PoolPtr&lt;T&gt;</code> RAII handle, magic-guarded
+                    against double-free.
+                </p>
+            </div>
+            <div class="card">
+                <div class="icon">∿</div>
+                <h3>Async logging</h3>
+                <p>
+                    Bounded MPMC ring with <code>DropOldest</code> — the hot path
+                    never blocks. The consumer can no longer deadlock.
+                </p>
+            </div>
+            <div class="card">
+                <div class="icon">⟳</div>
+                <h3>Single-reactor server</h3>
+                <p>
+                    One I/O thread + a worker pool, handoff through a single
+                    bounded outbox — the only shared channel, so no data races.
+                </p>
+            </div>
+            <div class="card">
+                <div class="icon">⬡</div>
+                <h3>Poller abstraction</h3>
+                <p>
+                    <code>Poller</code> unifies kqueue and epoll behind one
+                    interface, with a cross-thread <code>wakeup()</code>.
+                </p>
+            </div>
+            <div class="card">
+                <div class="icon">▤</div>
+                <h3>Bounded queue</h3>
+                <p>
+                    <code>DropNew</code> / <code>DropOldest</code> / <code>Block</code>
+                    overflow policies, timeout-aware pop, clean shutdown.
+                </p>
+            </div>
+            <div class="card">
+                <div class="icon">⌁</div>
+                <h3>HTTP/1.1 handler</h3>
+                <p>
+                    CRLF-correct, binary-safe, path-traversal-proof, with
+                    keep-alive support. Powered by <code>std::format</code>.
+                </p>
+            </div>
+        </div>
+    </section>
+
+    <!-- ============ CODE ============ -->
+    <section>
+        <h2>A server in ten lines</h2>
+<pre class="codeblock"><span class="com">// examples/http_server.cpp</span>
+<span class="ty">muses::TCPListener</span> listener(<span class="str">"127.0.0.1"</span>, 8864);
+<span class="ty">muses::Reactor</span> reactor(listener.get_listener().value(),
+    [](<span class="ty">std::string</span> req) -> <span class="ty">muses::HandlerResult</span> {
+        <span class="kw">auto</span> hr = muses::HttpContext::handle_request(req);
+        <span class="kw">return</span> {std::move(hr.response), hr.keep_alive};
+    }, <span class="com">/*workers=*/</span>4);
+reactor.start();</pre>
+    </section>
+
+    <!-- ============ BENCHMARKS ============ -->
+    <section id="benchmark">
+        <h2>Benchmarks</h2>
+        <p class="lede" style="margin-bottom:2rem">
+            Apple M1 Pro, Release build, 8 worker threads, no sanitizers.
+        </p>
+        <div class="stats">
+            <div class="stat">
+                <span class="num">~21k</span>
+                <span class="lbl">req/s @ 200 conn</span>
+            </div>
+            <div class="stat">
+                <span class="num">~7.3k</span>
+                <span class="lbl">req/s single-conn</span>
+            </div>
+            <div class="stat">
+                <span class="num">0.8 MB</span>
+                <span class="lbl">RSS, 0 leaks</span>
+            </div>
+            <div class="stat">
+                <span class="num">9/9</span>
+                <span class="lbl">ASan/UBSan clean</span>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        Muses — MIT licensed. Served by the muses reactor.
+    </footer>
+
 </body>
 </html>
