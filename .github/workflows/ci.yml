@@ -6,44 +6,18 @@ on:
   pull_request:
     branches: [master]
 
-# Two jobs only:
-#   - macOS (Apple clang) exercises the kqueue poller.
-#   - Ubuntu (clang) exercises the epoll poller.
-# We intentionally don't pin a third-party LLVM apt source: ubuntu-latest's
-# bundled clang is recent enough for C++23 library features once libstdc++ is
-# upgraded, and keeping the CI dependency-free is worth more than a second
-# compiler on Linux for a project this size.
+# macOS only. The project is developed and tested on Apple Silicon (Darwin 25,
+# Apple clang / libc++) which has the C++23 stdlib features in use
+# (std::flat_map, std::expected, std::format, std::span). Linux runners were
+# dropped because the distro libstdc++ doesn't consistently provide those yet;
+# epoll support is preserved in the source (net/epoll_poller.hpp) and can be
+# re-enabled on CI once a sufficiently new Linux toolchain is available.
 
 jobs:
   build-and-test:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-14, ubuntu-latest]
-
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-
-      # Ubuntu's default g++ (13.x) lags on C++23 stdlib (std::flat_map etc.).
-      # Install g++-14 from the distro's universe repo so libstdc++ backs the
-      # C++23 features. No third-party apt sources/keys needed.
-      - name: Update toolchain (Ubuntu)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq g++-14
-
-      - name: Set compiler
-        run: |
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            echo "CC=clang"   >> $GITHUB_ENV
-            echo "CXX=clang++" >> $GITHUB_ENV
-          else
-            echo "CC=gcc-14"  >> $GITHUB_ENV
-            echo "CXX=g++-14" >> $GITHUB_ENV
-          fi
 
       - name: Configure (Debug, sanitizers on)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
