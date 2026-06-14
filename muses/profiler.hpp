@@ -25,20 +25,55 @@
 #include <chrono>
 #include <sstream>
 #include <string>
+#include <utility>
 #include "muses/logging.hpp"
 
-#ifndef _MUSES_PROFILER_HPP
-#define _MUSES_PROFILER_HPP
+#ifndef MUSES_PROFILER_HPP
+#define MUSES_PROFILER_HPP
 
 namespace muses {
 
+// RAII scope timer. Logs the elapsed time (microseconds) at Debug level when
+// destroyed. Non-copyable (a timer owns a single measurement); movable so it
+// can be returned/stored, though the moved-from object becomes inert.
 class Profiler {
 public:
-    Profiler(const std::string& func_name): 
-    func_name(func_name),
-    start_time(std::chrono::high_resolution_clock::now()) {}
+    explicit Profiler(const std::string& func_name)
+    : func_name(func_name),
+      start_time(std::chrono::high_resolution_clock::now()),
+      active(true) {}
+
+    Profiler(const Profiler&) = delete;
+    Profiler& operator=(const Profiler&) = delete;
+
+    Profiler(Profiler&& other) noexcept
+    : func_name(std::move(other.func_name)),
+      start_time(other.start_time),
+      active(other.active) {
+        other.active = false;
+    }
+
+    Profiler& operator=(Profiler&& other) noexcept {
+        if (this != &other) {
+            report();
+            func_name = std::move(other.func_name);
+            start_time = other.start_time;
+            active = other.active;
+            other.active = false;
+        }
+        return *this;
+    }
 
     ~Profiler() {
+        report();
+    }
+
+private:
+    void report() {
+        if (!active) {
+            return;
+        }
+        active = false;
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
         std::stringstream ss;
@@ -46,11 +81,11 @@ public:
         MUSES_DEBUG(ss.str());
     }
 
-private:
     std::string func_name;
     std::chrono::high_resolution_clock::time_point start_time;
+    bool active;
 };
 
-}; 
+}  // namespace muses
 
 #endif

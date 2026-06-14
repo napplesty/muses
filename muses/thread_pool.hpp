@@ -22,8 +22,8 @@
 
 #pragma once
 
-#ifndef _MUSES_THREAD_POOL_HPP
-#define _MUSES_THREAD_POOL_HPP
+#ifndef MUSES_THREAD_POOL_HPP
+#define MUSES_THREAD_POOL_HPP
 
 #include <vector>
 #include <queue>
@@ -35,66 +35,101 @@
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
+#include <atomic>
 
 namespace muses {
 
+// A fixed-size pool of worker threads draining a task queue.
+//
+// Tasks are submitted via enqueue() and return a std::future of the result.
+// On shutdown (destruction or stop()) in-flight queued tasks are still
+// executed; new enqueue() calls after stop() return an invalid future instead
+// of throwing, so callers polling the future can detect rejection.
 class ThreadPool {
 public:
-    ThreadPool(unsigned int num_threads) : stop(false) {
-        for(unsigned int i = 0; i < num_threads; i++) {
+    explicit ThreadPool(unsigned int num_threads) : stop(false) {
+        for (unsigned int i = 0; i < num_threads; i++) {
             workers.emplace_back([this]() -> void {
                 while (true) {
                     std::function<void()> task;
                     {
                         std::unique_lock<std::mutex> lock(this->queue_mutex);
-                        this->condition.wait(lock, [this]{return this->stop || !this->tasks.empty();});
-                        if (this->stop && this->tasks.empty()) {
+                        this->condition.wait(lock, [this]{return this->stop.load() || !this->tasks.empty();});
+                        if (this->stop.load() && this->tasks.empty()) {
                             return;
                         }
                         task = std::move(this->tasks.front());
                         this->tasks.pop();
                     }
                     task();
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        --this->outstanding;
+                    }
+                    this->drained_condition.notify_all();
                 }
             });
         }
     }
 
+    ThreadPool(const ThreadPool&) = delete;
+    ThreadPool& operator=(const ThreadPool&) = delete;
+
+    // Submit a callable. Returns an invalid future if the pool has been
+    // stopped (caller checks future.valid()).
     template <class F, class... Args>
-    auto enqueue(F&& f, Args&&... args) -> std::future<typename std::invoke_result_t<F, Args...> > {
+    auto enqueue(F&& f, Args&&... args) -> std::future<typename std::invoke_result_t<F, Args...>> {
         using return_type = typename std::invoke_result_t<F, Args...>;
-        auto task = std::make_shared<std::packaged_task<return_type()>>(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+        auto task = std::make_shared<std::packaged_task<return_type()>>(
+            std::bind(std::forward<F>(f), std::forward<Args>(args)...));
         std::future<return_type> res = task->get_future();
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
-            if (stop) {
-                throw std::runtime_error("enqueue on stopped Thread Pool");
+            if (stop.load()) {
+                return std::future<return_type>{};  // invalid → caller detects rejection
             }
-            tasks.emplace([task]() {(*task)(); });
+            tasks.emplace([task]() { (*task)(); });
+            ++outstanding;
         }
         condition.notify_one();
         return res;
     }
 
-    ~ThreadPool() {
+    // Block until the queue is drained. Mainly for tests.
+    void wait_empty() {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        drained_condition.wait(lock, [this]{return outstanding == 0;});
+    }
+
+    void stop_pool() {
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
-            stop = true;
+            stop.store(true);
         }
         condition.notify_all();
-        for (std::thread& worker: workers) {
-            worker.join();
+        drained_condition.notify_all();
+    }
+
+    ~ThreadPool() {
+        stop_pool();
+        for (std::thread& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
         }
     }
 
 private:
     std::vector<std::thread> workers;
-    std::queue<std::function<void()> >tasks;
+    std::queue<std::function<void()>> tasks;
     std::mutex queue_mutex;
     std::condition_variable condition;
-    bool stop;
+    std::condition_variable drained_condition;
+    std::atomic<bool> stop;
+    // Number of tasks that have been enqueued but not yet finished.
+    std::size_t outstanding = 0;
 };
 
-};
+}  // namespace muses
 
 #endif
