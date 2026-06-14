@@ -22,145 +22,375 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <initializer_list>
+#include <memory>
 #include <mutex>
-#include "muses/compiler_defs.hpp"
-#include "muses/logging.hpp"
+#include <new>
+#include <vector>
 
-#ifndef _MUSES_MEMORY_POOL_HPP
-#define _MUSES_MEMORY_POOL_HPP
+#include "muses/config.hpp"
+
+#ifndef MUSES_MEMORY_POOL_HPP
+#define MUSES_MEMORY_POOL_HPP
 
 namespace muses {
 
-typedef enum {
-    ALLOCATABLE,
-    DEALLOCATABLE,
-    DEALLOCATING,
-} memory_block_status_t;
-
-typedef struct buffer_info {
-    unsigned int length;
-    unsigned int buf_begin;
-} buffer_info_t;
-
-typedef struct memory_block {
-    memory_block_status_t status;
-    unsigned int offset;
-    unsigned int ref_count;
-    unsigned char *data;
-} memory_block_t;
+// A size-classed memory pool with per-allocation reference counting.
+//
+// Each allocation is prefixed with a BlockHeader carrying:
+//   - a magic cookie to catch wild/double frees,
+//   - the owning size-class index (or ESCAPED for oversized allocations),
+//   - the slot size of that class,
+//   - an atomic reference count.
+//
+// Allocations are served from free-lists (one per size class) backed by a
+// pre-allocated arena. Oversized requests and arena underflow fall back to
+// ::operator new and are tagged ESCAPED so release() routes them back to
+// ::operator delete instead of corrupting a free-list.
+//
+// This replaces the old bump-allocator which mis-used a per-block "refcount"
+// that was actually an allocation counter, causing blocks to be recycled
+// while still referenced.
 
 class MemoryPool {
 public:
-    explicit MemoryPool(unsigned int block_size, unsigned int num_blocks):
-    block_size(block_size),
-    num_blocks(num_blocks),
-    memory_pool(nullptr),
-    allocating_block_front(0),
-    deallocating_threshold(2),
-    deallocating_count(0),
-    failed_count(0) {}
+    static constexpr uint32_t MAGIC = 0x4D55'5345;   // "MUSE"
+    static constexpr uint32_t ESCAPED = 0xFFFFu;
+
+    struct alignas(std::max_align_t) BlockHeader {
+        uint32_t magic;
+        uint32_t size_class;   // index into classes_, or ESCAPED
+        uint32_t slot_size;    // usable bytes (user request, not incl header)
+        uint32_t padding;      // keep refcount 8-byte aligned
+        std::atomic<int32_t> refcount;
+    };
+
+    struct Stats {
+        std::size_t live;             // allocations currently handed out
+        std::size_t recycled;         // currently sitting in free-lists
+        std::size_t escaped;          // served via ::operator new
+        std::size_t overflow_dropped; // reserved for future policy
+    };
+
+    // Default size classes (usable bytes per slot). Sorted ascendingly.
+    static constexpr std::initializer_list<uint32_t> DEFAULT_CLASSES = {
+        16, 32, 64, 128, 256, 512, 1024, 2048, 4096
+    };
+
+    explicit MemoryPool(std::size_t arena_bytes = 1 << 20,
+                        std::initializer_list<uint32_t> classes = DEFAULT_CLASSES)
+    : arena_bytes_(arena_bytes) {
+        // Normalize and sort the size classes.
+        for (uint32_t c : classes) {
+            if (c > 0) classes_.push_back(c);
+        }
+        std::sort(classes_.begin(), classes_.end());
+        classes_.erase(std::unique(classes_.begin(), classes_.end()), classes_.end());
+        if (classes_.empty()) {
+            classes_.push_back(64);
+        }
+        bins_.reserve(classes_.size());
+        for (std::size_t i = 0; i < classes_.size(); ++i) {
+            bins_.push_back(std::make_unique<Bin>());
+        }
+        allocate_arena();
+    }
 
     ~MemoryPool() {
-        if (memory_pool != nullptr) {
-            delete [] memory_pool_data;
-            delete [] memory_pool;
-        }
+        // Arena memory is owned by the pool; escaped allocations are owned by
+        // their PoolPtrs and freed via release(). Nothing else to do here.
     }
 
-    void initialize() {
-        if (memory_pool == nullptr) {
-            std::lock_guard<std::mutex> lock(rw_mutex);
-            if (memory_pool == nullptr) {
-                memory_pool = new memory_block_t[num_blocks];
-                memory_pool_data = new unsigned char[block_size*num_blocks];
-                for(unsigned int i = 0; i < num_blocks; i++) {
-                    memory_pool[i].status = ALLOCATABLE;
-                    memory_pool[i].ref_count = 0;
-                    memory_pool[i].data = memory_pool_data + i*block_size;
-                }
-            }
-        }
-    }
-    
-    void *allocate(size_t size) {
-        std::lock_guard<std::mutex> lock(rw_mutex);
-        for(int i = 0; i < num_blocks; i++) {
-            int block_idx = (i + allocating_block_front) % num_blocks;
-            if (memory_pool[block_idx].status == DEALLOCATABLE) {
-                memory_pool[block_idx].status = ALLOCATABLE;
-                memory_pool[block_idx].offset = 0;
-                memory_pool[block_idx].ref_count = 0;
-            } else if (memory_pool[block_idx].status != ALLOCATABLE) {
-                continue;
-            }
-            if (check_allocatable(size, block_idx)) {
-                int offset = memory_pool[block_idx].offset;
-                int *buffer_info_size = reinterpret_cast<int *>(memory_pool[block_idx].data + offset);
-                *buffer_info_size = size;
-                memory_pool[block_idx].offset += size + sizeof(buffer_info_t::length);
-                memory_pool[block_idx].ref_count ++;
-                return static_cast<void *>(buffer_info_size + 1);
-            } else {
-                deallocating_count ++;
-                if (deallocating_count > deallocating_threshold) {
-                    memory_pool[allocating_block_front].status = DEALLOCATING;
-                    allocatable_step();
-                    deallocating_count = 0;
-                }
-            }
-        }
-        failed_count ++;
-        return new unsigned char[size];
-    }
-
-    void deallocate(void *ptr) {
-        std::lock_guard<std::mutex> lock(rw_mutex);
-        if( reinterpret_cast<long>(ptr) > reinterpret_cast<long>(memory_pool_data + num_blocks * block_size) || 
-            reinterpret_cast<long>(ptr) < reinterpret_cast<long>(memory_pool_data)) {
-            delete [] reinterpret_cast<unsigned char *>(ptr);
-            return;
-        }
-        int buffer_idx = (reinterpret_cast<unsigned char *>(ptr)-memory_pool_data) / block_size;
-        if (memory_pool[buffer_idx].status == ALLOCATABLE) {
-            memory_pool[buffer_idx].status = DEALLOCATING;
-            allocatable_step();
-        } else if (memory_pool[buffer_idx].status == DEALLOCATABLE) {
-            MUSES_ERROR("deallocated failed.");
-            return;
-        }
-        
-        memory_pool[buffer_idx].ref_count --;
-        if(memory_pool[buffer_idx].ref_count == 0) {
-            memory_pool[buffer_idx].status = DEALLOCATABLE;
-        }
-    }
-
-private:
-    inline bool check_allocatable(size_t size, int block_idx) {
-        size_t allocate_size = size + sizeof(buffer_info_t::length);
-        return block_size - memory_pool[block_idx].offset >= allocate_size;
-    }
-
-    inline void allocatable_step() {
-        allocating_block_front = (allocating_block_front + 1) % num_blocks;
-    }
-
-public:
     MemoryPool(const MemoryPool&) = delete;
     MemoryPool& operator=(const MemoryPool&) = delete;
+    MemoryPool(MemoryPool&&) = delete;
+    MemoryPool& operator=(MemoryPool&&) = delete;
+
+    // Allocate `bytes` usable bytes. Returns a pointer to the usable region
+    // (header sits immediately before it). refcount is initialized to 1.
+    void* allocate(std::size_t bytes) {
+        std::size_t need = round_up_to_class(bytes);
+        std::size_t idx = pick_class(bytes);
+        if (idx >= classes_.size() || need == 0) {
+            // Oversized: escape to the global allocator.
+            return allocate_escaped(bytes);
+        }
+        Bin& bin = *bins_[idx];
+        std::lock_guard<std::mutex> lock(bin.mutex);
+        void* slot = pop_free(bin);
+        if (slot == nullptr) {
+            slot = carve_from_arena(classes_[idx]);
+            if (slot == nullptr) {
+                // Arena exhausted for this class; escape.
+                return allocate_escaped(bytes);
+            }
+        }
+        BlockHeader* h = header_of(slot);
+        init_header(h, static_cast<uint32_t>(idx), classes_[idx], bytes);
+        stats_.live.fetch_add(1, std::memory_order_relaxed);
+        return slot;
+    }
+
+    // Increment the reference count of a live allocation.
+    void retain(void* p) {
+        if (p == nullptr) return;
+        BlockHeader* h = header_of(p);
+        check_magic(h);
+        h->refcount.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Decrement the reference count; when it reaches zero the memory is
+    // returned to its free-list (or ::operator delete for escaped blocks).
+    void release(void* p) {
+        if (p == nullptr) return;
+        BlockHeader* h = header_of(p);
+        check_magic(h);
+        if (h->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            // Last reference: recycle.
+            stats_.live.fetch_sub(1, std::memory_order_relaxed);
+            if (h->size_class == ESCAPED) {
+                stats_.escaped.fetch_sub(1, std::memory_order_relaxed);
+                operator delete(h);
+            } else {
+                recycle_to_bin(h);
+            }
+        }
+    }
+
+    // Alias for release(), kept for source compatibility with old callers.
+    void deallocate(void* p) { release(p); }
+
+    Stats stats() const {
+        Stats s{};
+        s.live = stats_.live.load(std::memory_order_relaxed);
+        s.escaped = stats_.escaped.load(std::memory_order_relaxed);
+        std::size_t recycled = 0;
+        for (const auto& bin_ptr : bins_) {
+            std::lock_guard<std::mutex> lock(bin_ptr->mutex);
+            recycled += bin_ptr->free_count;
+        }
+        s.recycled = recycled;
+        s.overflow_dropped = stats_.overflow_dropped.load(std::memory_order_relaxed);
+        return s;
+    }
 
 private:
-    unsigned int block_size;
-    unsigned int num_blocks;
-    memory_block_t *memory_pool;
-    unsigned char *memory_pool_data;
-    std::mutex rw_mutex;
+    struct Bin {
+        std::mutex mutex;
+        void* head = nullptr;   // intrusive singly-linked free-list
+        std::size_t free_count = 0;
+    };
 
-    int allocating_block_front;
-    int deallocating_threshold;
-    int deallocating_count;
-    long long failed_count;
+    struct AtomicStats {
+        std::atomic<std::size_t> live{0};
+        std::atomic<std::size_t> escaped{0};
+        std::atomic<std::size_t> overflow_dropped{0};
+    };
+
+    static_assert(sizeof(BlockHeader) % alignof(std::max_align_t) == 0,
+                  "BlockHeader must keep user data max-aligned");
+
+    static BlockHeader* header_of(void* user) {
+        return reinterpret_cast<BlockHeader*>(
+            static_cast<std::byte*>(user) - sizeof(BlockHeader));
+    }
+
+    static void init_header(BlockHeader* h, uint32_t idx, uint32_t slot_size, std::size_t user_bytes) {
+        h->magic = MAGIC;
+        h->size_class = idx;
+        h->slot_size = slot_size;
+        h->padding = 0;
+        h->refcount.store(1, std::memory_order_relaxed);
+        (void)user_bytes;
+    }
+
+    static void check_magic(const BlockHeader* h) {
+        MUSES_ASSERT(h->magic == MAGIC, "memory pool: bad magic (wild/double free)");
+    }
+
+    // Next-link lives in the first word of a free slot's usable region.
+    static void** link_ptr(void* slot) {
+        return reinterpret_cast<void**>(slot);
+    }
+
+    static void push_free(Bin& bin, void* slot) {
+        *link_ptr(slot) = bin.head;
+        bin.head = slot;
+        ++bin.free_count;
+    }
+
+    static void* pop_free(Bin& bin) {
+        if (bin.head == nullptr) return nullptr;
+        void* slot = bin.head;
+        bin.head = *link_ptr(slot);
+        --bin.free_count;
+        return slot;
+    }
+
+    std::size_t pick_class(std::size_t user_bytes) const {
+        for (std::size_t i = 0; i < classes_.size(); ++i) {
+            if (classes_[i] >= user_bytes) return i;
+        }
+        return classes_.size();  // out of range → escape
+    }
+
+    std::size_t round_up_to_class(std::size_t user_bytes) const {
+        for (std::size_t i = 0; i < classes_.size(); ++i) {
+            if (classes_[i] >= user_bytes) return classes_[i];
+        }
+        return 0;  // oversized
+    }
+
+    void allocate_arena() {
+        std::size_t unit = sizeof(BlockHeader) + (classes_.empty() ? 64 : classes_.back());
+        unit = round_up(unit, alignof(std::max_align_t));
+        std::size_t count = arena_bytes_ / unit;
+        if (count == 0) count = 1;
+        arena_bytes_ = count * unit;
+        arena_.resize(arena_bytes_, std::byte{0});
+        bump_ = 0;
+    }
+
+    // Carve a fresh [header+slot] from the arena bump pointer. Not locked
+    // here; callers arrange locking as needed (called under the target bin's
+    // lock when servicing allocate, or under no lock during escape paths).
+    void* carve_from_arena(std::size_t slot_size) {
+        std::size_t need = round_up(sizeof(BlockHeader) + slot_size, alignof(std::max_align_t));
+        std::lock_guard<std::mutex> lock(arena_mu_);
+        if (bump_ + need > arena_bytes_) return nullptr;
+        std::byte* base = arena_.data() + bump_;
+        bump_ += need;
+        return base + sizeof(BlockHeader);
+    }
+
+    void* allocate_escaped(std::size_t bytes) {
+        // Raw ::operator new for the header+payload; tagged ESCAPED.
+        void* raw = operator new(sizeof(BlockHeader) + bytes);
+        BlockHeader* h = reinterpret_cast<BlockHeader*>(raw);
+        init_header(h, ESCAPED, static_cast<uint32_t>(bytes), bytes);
+        stats_.live.fetch_add(1, std::memory_order_relaxed);
+        stats_.escaped.fetch_add(1, std::memory_order_relaxed);
+        return reinterpret_cast<std::byte*>(raw) + sizeof(BlockHeader);
+    }
+
+    void recycle_to_bin(BlockHeader* h) {
+        std::size_t idx = h->size_class;
+        if (idx >= bins_.size()) {
+            // Should not happen for non-escaped; be defensive.
+            operator delete(h);
+            return;
+        }
+        Bin& bin = *bins_[idx];
+        std::lock_guard<std::mutex> lock(bin.mutex);
+        // Poison magic to detect stale use while on the free-list.
+        h->magic = 0;
+        push_free(bin, reinterpret_cast<std::byte*>(h) + sizeof(BlockHeader));
+    }
+
+    static std::size_t round_up(std::size_t n, std::size_t align) {
+        return (n + align - 1) & ~(align - 1);
+    }
+
+    std::vector<uint32_t> classes_;
+    std::vector<std::unique_ptr<Bin>> bins_;
+    std::vector<std::byte> arena_;
+    std::size_t arena_bytes_;
+    std::size_t bump_;
+    std::mutex arena_mu_;
+    AtomicStats stats_;
 };
 
+// RAII handle to a pool allocation. Copies retain (bump refcount); moves
+// transfer ownership; destruction releases.
+template <class T>
+class PoolPtr {
+public:
+    PoolPtr() : ptr_(nullptr), pool_(nullptr) {}
+    PoolPtr(std::nullptr_t) : ptr_(nullptr), pool_(nullptr) {}
+
+    // Takes ownership of a refcount==1 allocation produced by the pool.
+    PoolPtr(MemoryPool* pool, T* p) : ptr_(p), pool_(pool) {}
+
+    PoolPtr(const PoolPtr& other) : ptr_(other.ptr_), pool_(other.pool_) {
+        if (pool_ && ptr_) pool_->retain(ptr_);
+    }
+
+    PoolPtr(PoolPtr&& other) noexcept : ptr_(other.ptr_), pool_(other.pool_) {
+        other.ptr_ = nullptr;
+        other.pool_ = nullptr;
+    }
+
+    PoolPtr& operator=(const PoolPtr& other) {
+        if (this != &other) {
+            reset();
+            ptr_ = other.ptr_;
+            pool_ = other.pool_;
+            if (pool_ && ptr_) pool_->retain(ptr_);
+        }
+        return *this;
+    }
+
+    PoolPtr& operator=(PoolPtr&& other) noexcept {
+        if (this != &other) {
+            reset();
+            ptr_ = other.ptr_;
+            pool_ = other.pool_;
+            other.ptr_ = nullptr;
+            other.pool_ = nullptr;
+        }
+        return *this;
+    }
+
+    ~PoolPtr() { reset(); }
+
+    T& operator*() const { return *ptr_; }
+    T* operator->() const { return ptr_; }
+    T* get() const { return ptr_; }
+    MemoryPool* pool() const { return pool_; }
+    explicit operator bool() const { return ptr_ != nullptr; }
+
+    void reset() {
+        if (pool_ && ptr_) {
+            pool_->release(ptr_);
+        }
+        ptr_ = nullptr;
+        pool_ = nullptr;
+    }
+
+private:
+    T* ptr_;
+    MemoryPool* pool_;
 };
-#endif
+
+// Construct a T inside the pool via placement new. Returns a PoolPtr<T> with
+// refcount 1.
+template <class T, class... Args>
+PoolPtr<T> make_pool(MemoryPool& pool, Args&&... args) {
+    void* mem = pool.allocate(sizeof(T));
+    try {
+        T* obj = new (mem) T(std::forward<Args>(args)...);
+        return PoolPtr<T>(&pool, obj);
+    } catch (...) {
+        pool.release(mem);
+        throw;
+    }
+}
+
+// Destroy a T previously built with make_pool and release its memory.
+template <class T>
+void destroy_pool(PoolPtr<T>& p) {
+    if (p) {
+        p.get()->~T();
+        p.reset();
+    }
+}
+
+}  // namespace muses
+
+#endif  // MUSES_MEMORY_POOL_HPP
