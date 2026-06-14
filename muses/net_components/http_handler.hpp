@@ -32,6 +32,7 @@
 #include <string>
 
 #include "muses/logging.hpp"
+#include "muses/lru_cache.hpp"
 
 #ifndef MUSES_NET_HTTP_HANDLER_HPP
 #define MUSES_NET_HTTP_HANDLER_HPP
@@ -109,14 +110,32 @@ public:
     }
 
     static std::string read_file(const std::string& file_path, bool* exists) {
-        std::ifstream file(file_path, std::ios::binary);
+        // Open at end (ate) so tellg() yields the file size directly, then read
+        // the whole content in one shot. This replaces the old
+        // istreambuf_iterator approach which read char-by-char with repeated
+        // string push_back/reallocation — the #1 hot-path cost per profiling.
+        std::ifstream file(file_path, std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
             if (exists) *exists = false;
             return "";
         }
         if (exists) *exists = true;
-        return std::string((std::istreambuf_iterator<char>(file)),
-                           std::istreambuf_iterator<char>());
+        std::streamsize size = file.tellg();
+        if (size <= 0) return "";  // empty or indeterminate
+        file.seekg(0);
+        std::string content(static_cast<std::size_t>(size), '\0');
+        file.read(content.data(), size);
+        return content;
+    }
+
+    // Process-wide static file cache. Bounded by entry count (256), thread-safe.
+    // Reads of successful files are cached; misses read from disk via read_file.
+    // Failed reads (file not found) are NOT cached so a later-created file is
+    // still servable. The cache trades memory for repeated disk reads, which
+    // profiling showed was the worker hot path.
+    static LruCache<std::string, std::string>& file_cache() {
+        static LruCache<std::string, std::string> cache(/*max_entries=*/256);
+        return cache;
     }
 
     static std::string get_content_type(const std::string& file_path) {
@@ -154,12 +173,20 @@ public:
     }
 
     static std::string send_response(const std::string& file_path, bool keep_alive, bool* ok) {
+        // 1. Cache hit: serve from memory.
+        if (auto cached = file_cache().get(file_path)) {
+            if (ok) *ok = true;
+            return build_response(200, "OK", get_content_type(file_path), *cached, keep_alive);
+        }
+        // 2. Miss: read from disk.
         bool exists = false;
         std::string content = read_file(file_path, &exists);
         if (ok) *ok = exists;
         if (!exists) {
             return build_response(500, "Internal Server Error", "text/plain", "500 Error", false);
         }
+        // 3. Cache only successful reads (not 404s).
+        file_cache().put(file_path, content);
         return build_response(200, "OK", get_content_type(file_path), content, keep_alive);
     }
 
