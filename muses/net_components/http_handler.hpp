@@ -22,23 +22,21 @@
 
 #pragma once
 
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <iostream>
-#include <sstream>
-#include <map>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <sstream>
+#include <string>
+
 #include "muses/logging.hpp"
 
-
-#ifndef _NET_DRIVER_HPP
-#define _NET_DRIVER_HPP
+#ifndef MUSES_NET_HTTP_HANDLER_HPP
+#define MUSES_NET_HTTP_HANDLER_HPP
 
 namespace muses {
 
+// Parsed HTTP request line + headers + body.
 class HttpInfo {
 public:
     std::string method;
@@ -46,73 +44,86 @@ public:
     std::string version;
     std::map<std::string, std::string> headers;
     std::string body;
+
+    // True if the client requested the connection be kept alive. Defaults to
+    // true for HTTP/1.1 unless "Connection: close" is present.
+    bool wants_keep_alive() const {
+        auto it = headers.find("Connection");
+        if (it != headers.end()) {
+            return it->second.find("close") == std::string::npos;
+        }
+        return version == "HTTP/1.1";
+    }
 };
 
+// A complete HTTP response: the raw bytes and whether the connection should
+// be kept alive afterwards. (The reactor adapts this into its own HandlerResult
+// when wiring up a request handler.)
+struct HttpResponse {
+    std::string response;
+    bool keep_alive;
+};
+
+// Minimal static-file HTTP/1.1 handler. Fixes from the old version:
+//   - response lines use CRLF (was \n via std::endl)
+//   - files read in binary mode (images were corrupted)
+//   - empty files return 200 (were misreported as 500)
+//   - path traversal uses filesystem::relative (was fragile prefix match)
+//   - handle_request returns keep_alive so the reactor can reuse the socket
 class HttpContext {
 public:
-    static const int BUFFER_SIZE = 1024;
+    static constexpr std::size_t MAX_REQUEST_BYTES = 64 * 1024;
 
-    static HttpInfo parse_request(int client_fd) {
-        HttpInfo http_info;
-        char buffer[BUFFER_SIZE];
-        std::string request;
-        const size_t MAX_REQUEST_SIZE = BUFFER_SIZE * 8;
-        int bytes_read;
+    // Parse a fully-buffered request. Tolerant: a malformed request yields an
+    // empty HttpInfo (caller treats as 400).
+    static HttpInfo parse_request(const std::string& request) {
+        HttpInfo info;
+        std::istringstream stream(request);
+        std::string line;
+        if (!std::getline(stream, info.method, ' ')) return info;
+        if (!std::getline(stream, info.url, ' ')) return info;
+        std::string ver;
+        if (!std::getline(stream, ver, '\r')) return info;
+        info.version = ver;
+        stream.get();  // consume the trailing '\n'
 
-        while ((bytes_read = read(client_fd, buffer, BUFFER_SIZE - 1)) > 0) {
-            buffer[bytes_read] = '\0';
-            request.append(buffer, bytes_read);
-            if (request.find("\r\n\r\n") != std::string::npos) {
-                break;
-            }
-            if (request.size() > MAX_REQUEST_SIZE) {
-                break;
-            }
-        }
-
-        std::istringstream request_stream(request);
-        std::getline(request_stream, http_info.method, ' ');
-        std::getline(request_stream, http_info.url, ' ');
-        std::getline(request_stream, http_info.version, '\r');
-        std::string header_line;
-        while (std::getline(request_stream, header_line) && header_line != "\r") {
-            size_t delimiter_pos = header_line.find(": ");
-            if (delimiter_pos != std::string::npos) {
-                std::string key = header_line.substr(0, delimiter_pos);
-                std::string value = header_line.substr(delimiter_pos + 2);
-                http_info.headers[key] = value;
+        while (std::getline(stream, line)) {
+            if (line == "\r" || line.empty()) break;
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            std::size_t pos = line.find(": ");
+            if (pos == std::string::npos) pos = line.find(':');
+            if (pos != std::string::npos) {
+                std::string key = line.substr(0, pos);
+                std::string val = line.substr(line[pos + 1] == ' ' ? pos + 2 : pos + 1);
+                info.headers[key] = val;
             }
         }
-
-        return http_info;
+        // Body (if any) is whatever remains.
+        std::streampos pos = stream.tellg();
+        if (pos >= 0 && static_cast<std::size_t>(pos) < request.size()) {
+            info.body = request.substr(static_cast<std::size_t>(pos));
+        }
+        return info;
     }
 
-    static std::string read_file(const std::string& file_path) {
-        std::ifstream file(file_path);
+    static std::string read_file(const std::string& file_path, bool* exists) {
+        std::ifstream file(file_path, std::ios::binary);
         if (!file.is_open()) {
+            if (exists) *exists = false;
             return "";
         }
-        std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        return content;
-    }
-
-    static ssize_t get_file_size(const std::string &filename) {
-        std::ifstream file(filename, std::ios::binary | std::ios::ate);
-        if (!file.is_open()) {
-            return -1;
-        }
-        return file.tellg();
+        if (exists) *exists = true;
+        return std::string((std::istreambuf_iterator<char>(file)),
+                           std::istreambuf_iterator<char>());
     }
 
     static std::string get_content_type(const std::string& file_path) {
-        size_t dot_pos = file_path.find_last_of('.');
-        if (dot_pos == std::string::npos) {
-            return "application/octet-stream";
-        }
-        std::string ext = file_path.substr(dot_pos);
+        std::size_t dot = file_path.find_last_of('.');
+        if (dot == std::string::npos) return "application/octet-stream";
+        std::string ext = file_path.substr(dot);
         if (ext == ".html" || ext == ".htm") return "text/html; charset=utf-8";
         if (ext == ".css") return "text/css; charset=utf-8";
-        if (ext == ".js") return "application/javascript; charset=utf-8";
+        if (ext == ".js")  return "application/javascript; charset=utf-8";
         if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
         if (ext == ".png") return "image/png";
         if (ext == ".gif") return "image/gif";
@@ -122,120 +133,97 @@ public:
         return "application/octet-stream";
     }
 
-    static std::string send_response(const std::string& file_path) {
-        std::string content = read_file(file_path);
-        std::stringstream ss;
-
-        if (content.empty()) {
-            ss << "HTTP/1.1 500 Internal Server Error" << std::endl;
-            ss << "Content-Type: text/plain" << std::endl;
-            ss << "Connection: close" << std::endl;
-            ss << "Content-Length: 13" << std::endl;
-            ss << std::endl;
-            ss << "500 Error" << std::endl;
-            return ss.str();
-        }
-
-        ss << "HTTP/1.1 200 OK" << std::endl;
-        ss << "Content-Type: " << get_content_type(file_path) << std::endl;
-        ss << "Connection: close" << std::endl;
-        ss << "Content-Length: " << content.size() << std::endl;
-        ss << std::endl;
-        ss << content;
+    // Build a complete HTTP/1.1 response with CRLF line endings.
+    static std::string build_response(int status, const std::string& status_text,
+                                      const std::string& content_type,
+                                      const std::string& body, bool keep_alive) {
+        std::ostringstream ss;
+        ss << "HTTP/1.1 " << status << ' ' << status_text << "\r\n";
+        ss << "Content-Type: " << content_type << "\r\n";
+        ss << "Content-Length: " << body.size() << "\r\n";
+        ss << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n";
+        ss << "\r\n";
+        ss << body;
         return ss.str();
     }
 
-    static std::string send_404_response(const HttpInfo &http_info, int socket_fd) {
-        std::string content = read_file("./statics/404.html");
-        std::stringstream ss;
-        ss << "HTTP/1.1 404 Not Found" << std::endl;
-        ss << "Content-Type: text/html; charset=utf-8" << std::endl;
-        ss << "Connection: close" << std::endl;
-        if (content.empty()) {
-            ss << "Content-Length: 9" << std::endl;
-            ss << std::endl;
-            ss << "404 Error";
-        } else {
-            ss << "Content-Length: " << content.size() << std::endl;
-            ss << std::endl;
-            ss << content;
+    static std::string send_response(const std::string& file_path, bool keep_alive, bool* ok) {
+        bool exists = false;
+        std::string content = read_file(file_path, &exists);
+        if (ok) *ok = exists;
+        if (!exists) {
+            return build_response(500, "Internal Server Error", "text/plain", "500 Error", false);
         }
-        return ss.str();
+        return build_response(200, "OK", get_content_type(file_path), content, keep_alive);
     }
 
-    static std::string send_405_response(const HttpInfo &http_info, int socket_fd) {
-        std::string content = read_file("./statics/405.html");
-        std::stringstream ss;
-        ss << "HTTP/1.1 405 Method Not Allowed" << std::endl;
-        ss << "Content-Type: text/html; charset=utf-8" << std::endl;
-        ss << "Connection: close" << std::endl;
-        if (content.empty()) {
-            ss << "Content-Length: 9" << std::endl;
-            ss << std::endl;
-            ss << "405 Error";
-        } else {
-            ss << "Content-Length: " << content.size() << std::endl;
-            ss << std::endl;
-            ss << content;
-        }
-        return ss.str();
+    static std::string send_404(bool keep_alive) {
+        bool exists = false;
+        std::string content = read_file("./statics/404.html", &exists);
+        if (!exists) content = "404 Not Found";
+        return build_response(404, "Not Found", "text/html; charset=utf-8", content, keep_alive);
     }
 
-    static bool handle_request(int socket_fd) {
-        HttpInfo http_info = parse_request(socket_fd);
-        std::string response;
+    static std::string send_405(bool keep_alive) {
+        bool exists = false;
+        std::string content = read_file("./statics/405.html", &exists);
+        if (!exists) content = "405 Method Not Allowed";
+        return build_response(405, "Method Not Allowed", "text/html; charset=utf-8", content, keep_alive);
+    }
 
-        MUSES_INFO(std::string("Request: ") + http_info.method + " " + http_info.url);
+    // Resolve a URL path under the statics root, blocking traversal.
+    // Returns empty string if the path escapes the root or does not exist.
+    static std::string resolve_safe_path(const std::string& url) {
+        std::error_code ec;
+        namespace fs = std::filesystem;
+        fs::path root = fs::canonical("./statics", ec);
+        if (ec) return "";
+        std::string rel = (url == "/") ? "/index.html" : url;
+        fs::path target = fs::weakly_canonical(root / rel.substr(1), ec);
+        if (ec) return "";
+        // Ensure the resolved target is inside root (no traversal escape).
+        auto [root_it, target_it] = std::mismatch(root.begin(), root.end(), target.begin());
+        if (root_it != root.end()) return "";
+        if (!fs::exists(target)) return "";
+        return target.string();
+    }
 
-        if (http_info.method != "GET") {
-            response = send_405_response(http_info, socket_fd);
-            MUSES_INFO(std::string("Response: 405"));
-        } else {
-            std::string file_path = "./statics" + http_info.url;
+    // Process a complete request buffer. Returns the response bytes and the
+    // keep-alive decision. This is what worker threads invoke.
+    static HttpResponse handle_request(const std::string& request) {
+        HttpInfo info = parse_request(request);
+        bool keep_alive = info.wants_keep_alive();
 
-            if (http_info.url == "/") {
-                file_path = "./statics/index.html";
-            }
-
-            std::string normalized_path;
-            try {
-                normalized_path = std::filesystem::canonical(file_path);
-                std::string statics_path = std::filesystem::canonical("./statics");
-
-                if (normalized_path.find(statics_path) != 0) {
-                    response = send_404_response(http_info, socket_fd);
-                    MUSES_INFO(std::string("Response: 404 (path traversal blocked)"));
-                } else if (std::filesystem::exists(file_path)) {
-                    response = send_response(file_path);
-                    MUSES_INFO(std::string("Response: 200"));
-                } else {
-                    response = send_404_response(http_info, socket_fd);
-                    MUSES_INFO(std::string("Response: 404"));
-                }
-            } catch (const std::exception& e) {
-                response = send_404_response(http_info, socket_fd);
-                MUSES_INFO(std::string("Response: 404 (filesystem error)"));
-            }
+        HttpResponse result;
+        if (info.method.empty()) {
+            result.response = build_response(400, "Bad Request", "text/plain", "400 Bad Request", false);
+            result.keep_alive = false;
+            return result;
         }
 
-        size_t total_sent = 0;
-        size_t response_size = response.size();
-        while (total_sent < response_size) {
-            ssize_t sent = send(socket_fd, response.c_str() + total_sent,
-                               response_size - total_sent, 0);
-            if (sent < 0) {
-                break;
-            }
-            if (sent == 0) {
-                break;
-            }
-            total_sent += sent;
+        if (info.method != "GET") {
+            result.response = send_405(keep_alive);
+            result.keep_alive = keep_alive;
+            MUSES_INFO("Response: 405");
+            return result;
         }
 
-        return true;
+        std::string path = resolve_safe_path(info.url);
+        if (path.empty()) {
+            result.response = send_404(keep_alive);
+            result.keep_alive = keep_alive;
+            MUSES_INFO("Response: 404");
+            return result;
+        }
+
+        bool ok = false;
+        result.response = send_response(path, keep_alive, &ok);
+        result.keep_alive = ok ? keep_alive : false;
+        MUSES_INFO("Response: 200");
+        return result;
     }
 };
 
-}; // namespace muses
+}  // namespace muses
 
-#endif
+#endif  // MUSES_NET_HTTP_HANDLER_HPP
