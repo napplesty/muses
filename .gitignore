@@ -1,0 +1,24 @@
+# Build directories and artifacts
+/build/
+/build_rel/
+/_deps/
+
+# In-source build leftovers (CMake will regenerate these in build/)
+/CMakeCache.txt
+/CMakeFiles/
+/CTestTestfile.cmake
+/Makefile
+/cmake_install.cmake
+/compile_commands.json
+/statics/
+/muses_http_server
+/test_*
+
+# Test/log outputs
+/log.txt
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

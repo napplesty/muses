@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / ${{ matrix.compiler }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            compiler: clang
+          - os: ubuntu-24.04
+            compiler: gcc
+          - os: ubuntu-24.04
+            compiler: clang
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set compiler
+        if: matrix.compiler == 'clang'
+        run: |
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CXX=clang++" >> $GITHUB_ENV
+      - if: matrix.compiler == 'gcc'
+        run: |
+          echo "CC=gcc" >> $GITHUB_ENV
+          echo "CXX=g++" >> $GITHUB_ENV
+
+      - name: Configure (Debug, sanitizers on)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure
+
+      # Release build without sanitizers to catch optimizer/codegen issues.
+      - name: Configure (Release)
+        run: cmake -S . -B build_rel -DCMAKE_BUILD_TYPE=Release -DMUSES_ENABLE_SANITIZERS=OFF
+      - name: Build (Release)
+        run: cmake --build build_rel -j
