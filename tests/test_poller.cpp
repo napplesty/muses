@@ -35,7 +35,7 @@ TEST_CASE("Poller: add and detect readable") {
     REQUIRE(::write(sv[1], &byte, 1) == 1);
 
     muses::PollEvent events[4];
-    int n = poller->wait(events, 4, 200);
+    int n = poller->wait(events, 200);
     CHECK(n == 1);
     CHECK(events[0].fd == sv[0]);
     CHECK(muses::has(events[0].mask, muses::EventMask::Readable));
@@ -44,7 +44,7 @@ TEST_CASE("Poller: add and detect readable") {
     // Drain the byte; next wait should time out (nothing readable).
     char rb;
     ::read(sv[0], &rb, 1);
-    n = poller->wait(events, 4, 80);
+    n = poller->wait(events, 80);
     CHECK(n == 0);
 
     poller->del(sv[0]);
@@ -62,7 +62,7 @@ TEST_CASE("Poller: del stops events") {
     char byte = 'y';
     ::write(sv[1], &byte, 1);
     muses::PollEvent events[4];
-    int n = poller->wait(events, 4, 80);
+    int n = poller->wait(events, 80);
     CHECK(n == 0);  // deleted → no events
     ::close(sv[0]);
     ::close(sv[1]);
@@ -80,7 +80,7 @@ TEST_CASE("Poller: wakeup interrupts a blocked wait") {
         poller->wakeup();
     });
     muses::PollEvent events[4];
-    int n = poller->wait(events, 4, 5000);  // would block 5s if not woken
+    int n = poller->wait(events, 5000);  // would block 5s if not woken
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::steady_clock::now() - start);
     waker.join();
@@ -100,7 +100,7 @@ TEST_CASE("Poller: timeout works") {
 
     auto start = std::chrono::steady_clock::now();
     muses::PollEvent events[4];
-    int n = poller->wait(events, 4, 70);
+    int n = poller->wait(events, 70);
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::steady_clock::now() - start);
     CHECK(n == 0);

@@ -23,7 +23,7 @@
 #pragma once
 
 #include <chrono>
-#include <sstream>
+#include <format>
 #include <string>
 #include <utility>
 #include "muses/logging.hpp"
@@ -76,9 +76,7 @@ private:
         active = false;
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        std::stringstream ss;
-        ss << "[Profiler] func: " << func_name << ", duration: " << duration << " us.";
-        MUSES_DEBUG(ss.str());
+        MUSES_DEBUG(std::format("[Profiler] func: {}, duration: {} us.", func_name, duration));
     }
 
     std::string func_name;

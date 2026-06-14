@@ -30,11 +30,12 @@ int main() {
     if (const char* p = std::getenv("MUSES_PORT")) port = static_cast<unsigned short>(std::atoi(p));
 
     muses::TCPListener listener("127.0.0.1", port);
-    int lfd = listener.get_listener();
-    if (lfd < 0) {
-        std::cerr << "failed to listen\n";
+    auto lfd_result = listener.get_listener();
+    if (!lfd_result) {
+        std::cerr << "failed to listen: " << lfd_result.error() << "\n";
         return 1;
     }
+    int lfd = *lfd_result;
 
     muses::Reactor reactor(lfd, [](const std::string& req) -> muses::HandlerResult {
         auto hr = muses::HttpContext::handle_request(req);

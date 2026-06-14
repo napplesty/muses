@@ -30,7 +30,7 @@
 #include <unistd.h>
 
 #include <cerrno>
-#include <unordered_map>
+#include <flat_map>
 #include <vector>
 
 #include "muses/logging.hpp"
@@ -94,11 +94,11 @@ public:
         return true;
     }
 
-    int wait(PollEvent* out, int max, int timeout_ms) override {
+    int wait(std::span<PollEvent> out, int timeout_ms) override {
         if (kq_ == -1) return -1;
+        if (out.empty()) return 0;
         events_.clear();
-        events_.resize(static_cast<std::size_t>(max > 0 ? max : 0));
-        if (events_.empty()) return 0;
+        events_.resize(out.size());
 
         struct timespec ts{};
         struct timespec* pts = nullptr;
@@ -164,7 +164,8 @@ private:
 
     static constexpr uintptr_t kWakeIdent = 1;
     int kq_;
-    std::unordered_map<int, void*> fds_;
+    // flat_map: contiguous storage, cache-friendly for the small fd set.
+    std::flat_map<int, void*> fds_;
     std::vector<struct kevent> events_;
 };
 

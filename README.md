@@ -1,12 +1,14 @@
 # Muses
 
-A header-only C++20 collection of concurrency and networking primitives:
+A header-only C++23 collection of concurrency and networking primitives:
 a thread pool, a size-classed memory pool with per-allocation reference
 counting, a bounded MPMC queue, an asynchronous logger, and a reactor-based
 HTTP server (kqueue on macOS, epoll on Linux).
 
 This is a learning/portfolio project. The components are independently tested
-under AddressSanitizer + UBSan.
+under AddressSanitizer + UBSan. They use C++23 facilities where they help:
+`std::format` (logging/HTTP formatting), `std::flat_map` (connection tables),
+`std::expected` (error paths), `std::span` (poller interface).
 
 ## Status
 
@@ -24,7 +26,8 @@ under AddressSanitizer + UBSan.
 
 ## Build
 
-Requires CMake >= 3.18 and a C++20 compiler (clang >= 14 / gcc >= 11).
+Requires CMake >= 3.18 and a C++23 compiler (clang >= 17 / gcc >= 14; libc++ or libstdc++ with std::flat_map, std::expected, std::format, std::span).
+Note: std::move_only_function and std::stacktrace are NOT yet used (incomplete in current libc++/libstdc++).
 
 ```bash
 cmake -S . -B build

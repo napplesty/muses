@@ -33,6 +33,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <vector>
+#include <span>
 
 #include "muses/logging.hpp"
 #include "muses/net/poller.hpp"
@@ -91,11 +92,11 @@ public:
         return ::epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr) == 0;
     }
 
-    int wait(PollEvent* out, int max, int timeout_ms) override {
+    int wait(std::span<PollEvent> out, int timeout_ms) override {
         if (epfd_ == -1) return -1;
+        if (out.empty()) return 0;
         events_.clear();
-        events_.resize(static_cast<std::size_t>(max > 0 ? max : 0));
-        if (events_.empty()) return 0;
+        events_.resize(out.size());
 
         int n = ::epoll_wait(epfd_, events_.data(),
                              static_cast<int>(events_.size()), timeout_ms);

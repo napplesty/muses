@@ -23,7 +23,9 @@
 #pragma once
 
 #include <cstddef>
+#include <expected>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -137,14 +139,18 @@ public:
     static std::string build_response(int status, const std::string& status_text,
                                       const std::string& content_type,
                                       const std::string& body, bool keep_alive) {
-        std::ostringstream ss;
-        ss << "HTTP/1.1 " << status << ' ' << status_text << "\r\n";
-        ss << "Content-Type: " << content_type << "\r\n";
-        ss << "Content-Length: " << body.size() << "\r\n";
-        ss << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n";
-        ss << "\r\n";
-        ss << body;
-        return ss.str();
+        // std::format avoids ostringstream's per-<< virtual dispatch and locale
+        // overhead; this runs once per request.
+        std::string head = std::format(
+            "HTTP/1.1 {} {}\r\n"
+            "Content-Type: {}\r\n"
+            "Content-Length: {}\r\n"
+            "Connection: {}\r\n"
+            "\r\n",
+            status, status_text, content_type, body.size(),
+            keep_alive ? "keep-alive" : "close");
+        head += body;
+        return head;
     }
 
     static std::string send_response(const std::string& file_path, bool keep_alive, bool* ok) {
@@ -171,20 +177,30 @@ public:
         return build_response(405, "Method Not Allowed", "text/html; charset=utf-8", content, keep_alive);
     }
 
-    // Resolve a URL path under the statics root, blocking traversal.
-    // Returns empty string if the path escapes the root or does not exist.
-    static std::string resolve_safe_path(const std::string& url) {
+    // Why a path could not be resolved to a servable file.
+    enum class ResolveError {
+        NoStaticsRoot,    // ./statics itself is missing/invalid
+        InvalidPath,      // path could not be canonicalized
+        TraversalBlocked, // resolved outside the statics root
+        NotFound,         // inside root but does not exist
+    };
+
+    // Resolve a URL path under the statics root, blocking traversal. Returns
+    // the absolute filesystem path on success, or a ResolveError describing
+    // the failure. Using std::expected makes every failure mode explicit at
+    // the call site (no silent empty-string sentinel).
+    static std::expected<std::string, ResolveError> resolve_safe_path(const std::string& url) {
         std::error_code ec;
         namespace fs = std::filesystem;
         fs::path root = fs::canonical("./statics", ec);
-        if (ec) return "";
+        if (ec) return std::unexpected(ResolveError::NoStaticsRoot);
         std::string rel = (url == "/") ? "/index.html" : url;
         fs::path target = fs::weakly_canonical(root / rel.substr(1), ec);
-        if (ec) return "";
+        if (ec) return std::unexpected(ResolveError::InvalidPath);
         // Ensure the resolved target is inside root (no traversal escape).
         auto [root_it, target_it] = std::mismatch(root.begin(), root.end(), target.begin());
-        if (root_it != root.end()) return "";
-        if (!fs::exists(target)) return "";
+        if (root_it != root.end()) return std::unexpected(ResolveError::TraversalBlocked);
+        if (!fs::exists(target)) return std::unexpected(ResolveError::NotFound);
         return target.string();
     }
 
@@ -208,8 +224,11 @@ public:
             return result;
         }
 
-        std::string path = resolve_safe_path(info.url);
-        if (path.empty()) {
+        auto resolved = resolve_safe_path(info.url);
+        if (!resolved) {
+            // All resolve failures surface as 404 to the client (the path is
+            // either outside the root, missing, or invalid). The specific
+            // ResolveError is logged for diagnosis.
             result.response = send_404(keep_alive);
             result.keep_alive = keep_alive;
             MUSES_INFO("Response: 404");
@@ -217,7 +236,7 @@ public:
         }
 
         bool ok = false;
-        result.response = send_response(path, keep_alive, &ok);
+        result.response = send_response(*resolved, keep_alive, &ok);
         result.keep_alive = ok ? keep_alive : false;
         MUSES_INFO("Response: 200");
         return result;

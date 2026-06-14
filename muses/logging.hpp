@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <ctime>
+#include <format>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -183,12 +184,13 @@ private:
         localtime_r(&t, &tm_local);
         std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_local);
 
-        std::ostringstream ss;
-        ss << '[' << level_string(std::get<0>(e)) << "] "
-           << time_buf << ' '
-           << std::get<1>(e) << ": "
-           << std::get<2>(e) << '\n';
-        return ss.str();
+        // std::format is noticeably faster than ostringstream (no virtual
+        // dispatch, no locale, fewer allocations) and this is the hot path.
+        return std::format("[{}] {} {}: {}\n",
+                           level_string(std::get<0>(e)),
+                           time_buf,
+                           std::get<1>(e),
+                           std::get<2>(e));
     }
 
     void flush_buffer_if_needed() {

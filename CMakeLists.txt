@@ -5,7 +5,7 @@ project(muses VERSION 0.1.0 LANGUAGES CXX)
 
 # --- Build configuration ---------------------------------------------------
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -16,7 +16,7 @@ endif()
 # Header-only library: consumers need the include root.
 add_library(muses INTERFACE)
 target_include_directories(muses INTERFACE ${CMAKE_SOURCE_DIR})
-target_compile_features(muses INTERFACE cxx_std_20)
+target_compile_features(muses INTERFACE cxx_std_23)
 
 # Warnings apply to everything that links muses (including the tests).
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")

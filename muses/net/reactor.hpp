@@ -30,11 +30,13 @@
 
 #include <atomic>
 #include <cstring>
+#include <expected>
+#include <flat_map>
+#include <format>
 #include <functional>
 #include <memory>
 #include <string>
 #include <thread>
-#include <unordered_map>
 
 #include "muses/bounded_queue.hpp"
 #include "muses/logging.hpp"
@@ -112,9 +114,10 @@ public:
         if (poller_) poller_->wakeup();
         if (reactor_thread_.joinable()) reactor_thread_.join();
         outbox_.stop();
-        // Close any remaining connections.
-        for (auto& [fd, conn] : connections_) {
-            ::close(fd);
+        // Close any remaining connections. Note: flat_map's iterator
+        // dereferences to a proxy, so bind via const auto& and copy the fd.
+        for (const auto& kv : connections_) {
+            ::close(kv.first);
         }
         connections_.clear();
         if (poller_) poller_->del(listen_fd_);
@@ -131,7 +134,7 @@ private:
         constexpr int kMaxEvents = 64;
         PollEvent events[kMaxEvents];
         while (running_.load(std::memory_order_acquire)) {
-            int n = poller_->wait(events, kMaxEvents, 100);
+            int n = poller_->wait(events, 100);
             if (n < 0) {
                 MUSES_ERROR("Reactor: poller wait failed");
                 continue;
@@ -295,8 +298,10 @@ private:
     std::unique_ptr<Poller> poller_;
     std::thread reactor_thread_;
     std::atomic<bool> running_;
-    // Reactor-thread-only state (no lock needed).
-    std::unordered_map<int, Connection> connections_;
+    // Reactor-thread-only state (no lock needed). flat_map keeps the active
+    // connection set in a contiguous array — better cache locality than a
+    // node-based unordered_map for the typically-small fd set.
+    std::flat_map<int, Connection> connections_;
 };
 
 // Convenience: a simple synchronous TCP listener wrapping bind/listen.
@@ -312,13 +317,14 @@ public:
     TCPListener(const TCPListener&) = delete;
     TCPListener& operator=(const TCPListener&) = delete;
 
-    // Returns the listen fd, creating it on first call. Returns -1 on failure.
-    int get_listener() {
+    // Returns the listen fd, creating it on first call. On failure returns an
+    // unexpected with a human-readable reason (including errno). The caller
+    // must check the result before using the fd.
+    std::expected<int, std::string> get_listener() {
         if (listen_fd_ != -1) return listen_fd_;
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (listen_fd_ < 0) {
-            MUSES_ERROR("TCPListener: socket failed");
-            return -1;
+            return std::unexpected(std::format("TCPListener: socket() failed: {}", std::strerror(errno)));
         }
         int opt = 1;
         ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -327,16 +333,16 @@ public:
         addr.sin_addr.s_addr = ::inet_addr(ip_.c_str());
         addr.sin_port = htons(port_);
         if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-            MUSES_ERROR("TCPListener: bind failed");
+            std::string why = std::format("TCPListener: bind({}, {}) failed: {}", ip_, port_, std::strerror(errno));
             ::close(listen_fd_);
             listen_fd_ = -1;
-            return -1;
+            return std::unexpected(why);
         }
         if (::listen(listen_fd_, SOMAXCONN) < 0) {
-            MUSES_ERROR("TCPListener: listen failed");
+            std::string why = std::format("TCPListener: listen() failed: {}", std::strerror(errno));
             ::close(listen_fd_);
             listen_fd_ = -1;
-            return -1;
+            return std::unexpected(why);
         }
         // Make the listen socket non-blocking for the reactor.
         int flags = ::fcntl(listen_fd_, F_GETFL, 0);

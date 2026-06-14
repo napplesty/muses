@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 
 #ifndef MUSES_NET_POLLER_HPP
 #define MUSES_NET_POLLER_HPP
@@ -71,8 +72,9 @@ public:
     virtual bool del(int fd) = 0;
 
     // Block up to timeout_ms (-1 = forever) for events; fill `out` and return
-    // the count. Returns -1 on error.
-    virtual int wait(PollEvent* out, int max, int timeout_ms) = 0;
+    // the count written. Returns -1 on error. The span carries its own size so
+    // callers cannot overrun the buffer.
+    virtual int wait(std::span<PollEvent> out, int timeout_ms) = 0;
 
     // Interrupt a blocked wait() from another thread. Idempotent.
     virtual void wakeup() = 0;
