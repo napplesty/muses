@@ -15,7 +15,11 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: macos-14
+    # macos-latest tracks the newest macOS GitHub ships (macOS 15 now,
+    # migrating to macOS 26 in June 2026), on Apple Silicon. This matches the
+    # dev environment (Darwin 25 / Apple clang / libc++) which has full C++23
+    # stdlib support (std::flat_map, std::expected, std::format, std::span).
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
