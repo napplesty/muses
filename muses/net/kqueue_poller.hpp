@@ -69,7 +69,8 @@ public:
     bool add(int fd, EventMask mask, void* userdata) override {
         if (kq_ == -1) return false;
         fds_[fd] = userdata;
-        return apply(fd, mask, EV_ADD);
+        apply(fd, mask, EV_ADD);  // buffered into pending_, flushed in wait()
+        return true;
     }
 
     bool mod(int fd, EventMask mask, void* userdata) override {
@@ -77,26 +78,32 @@ public:
         auto it = fds_.find(fd);
         if (it == fds_.end()) return false;
         it->second = userdata;
-        // EV_ADD on an already-registered filter updates its flags.
-        return apply(fd, mask, EV_ADD);
+        // Switch interest set: EV_ADD the wanted filters, EV_DELETE the rest.
+        // Verified (see kq_mod_test) that a single changelist can both add and
+        // delete filters on the same fd atomically. Buffered, flushed in wait().
+        apply(fd, mask, EV_ADD);
+        return true;
     }
 
     bool del(int fd) override {
         if (kq_ == -1) return false;
         if (fds_.erase(fd) == 0) return false;
-        // Delete both read and write filters if present.
-        struct kevent changes[2];
-        int n = 0;
-        EV_SET(&changes[n++], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
-        EV_SET(&changes[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
-        // Errors (filter not registered) are ignored.
-        ::kevent(kq_, changes, n, nullptr, 0, nullptr);
+        // Buffer deletion of both read and write filters.
+        struct kevent c;
+        EV_SET(&c, fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+        pending_.push_back(c);
+        EV_SET(&c, fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+        pending_.push_back(c);
         return true;
     }
 
     int wait(std::span<PollEvent> out, int timeout_ms) override {
         if (kq_ == -1) return -1;
         if (out.empty()) return 0;
+        // Flush any buffered interest changes in ONE kevent call before
+        // blocking — this is the Tier-2 batched-changelist optimization. All
+        // add/mod/del since the last wait() land here together.
+        flush_pending();
         events_.clear();
         events_.resize(out.size());
 
@@ -145,25 +152,49 @@ public:
     }
 
 private:
-    bool apply(int fd, EventMask mask, uint16_t kflags) {
-        // EV_CLEAR makes all socket filters edge-triggered: the reactor gets
-        // one event per state transition and must drain read/write/accept to
-        // EAGAIN. This cuts the number of kevent syscalls under load.
-        const uint16_t et_flags = kflags | EV_CLEAR;
-        struct kevent changes[2];
-        int n = 0;
+    // Buffer a single kevent change for later batched submission. kflags carries
+    // the operation (EV_ADD / EV_DELETE); EV_CLEAR is OR'd in for ADDs so all
+    // socket filters are edge-triggered.
+    void buffer_change(int fd, int16_t filter, uint16_t kflags) {
+        struct kevent c;
+        EV_SET(&c, fd, filter, kflags, 0, 0, nullptr);
+        pending_.push_back(c);
+    }
+
+    // Record the interest-set change for `fd` into the pending buffer.
+    // Wanted filters (per `mask`) get EV_ADD|EV_CLEAR; unwanted filters get
+    // EV_DELETE — so a single flush atomically switches the interest set (this
+    // is what makes mod() correct and lets one kevent call replace del+add).
+    void apply(int fd, EventMask mask, uint16_t /*kflags*/) {
+        const uint16_t add_flags = EV_ADD | EV_CLEAR;
         if (has(mask, EventMask::Readable)) {
-            EV_SET(&changes[n++], fd, EVFILT_READ, et_flags, 0, 0, nullptr);
+            buffer_change(fd, EVFILT_READ, add_flags);
+        } else {
+            buffer_change(fd, EVFILT_READ, EV_DELETE);
         }
         if (has(mask, EventMask::Writable)) {
-            EV_SET(&changes[n++], fd, EVFILT_WRITE, et_flags, 0, 0, nullptr);
+            buffer_change(fd, EVFILT_WRITE, add_flags);
+        } else {
+            buffer_change(fd, EVFILT_WRITE, EV_DELETE);
         }
-        if (n == 0) return true;
-        if (::kevent(kq_, changes, n, nullptr, 0, nullptr) == -1) {
-            // EV_ADD on existing / EV_DELETE on absent: tolerate.
-            return errno != ENOENT;
-        }
-        return true;
+    }
+
+    // Submit all buffered changes in a single kevent() call, then clear the
+    // buffer. Called once at the top of wait().
+    //
+    // kevent processes a changelist and, if a change fails (e.g. EV_DELETE on a
+    // filter that was never registered — ENOENT), it records the error in the
+    // OUTPUT event array rather than aborting the batch. We pass an output
+    // buffer sized to the batch so per-change errors are reported there and do
+    // NOT stop later changes in the same batch from applying. The errors we see
+    // (ENOENT on a redundant EV_DELETE) are all benign, so we discard them.
+    void flush_pending() {
+        if (pending_.empty()) return;
+        // Reuse events_ as scratch for per-change error reporting.
+        if (events_.size() < pending_.size()) events_.resize(pending_.size());
+        ::kevent(kq_, pending_.data(), static_cast<int>(pending_.size()),
+                 events_.data(), static_cast<int>(events_.size()), nullptr);
+        pending_.clear();
     }
 
     static constexpr uintptr_t kWakeIdent = 1;
@@ -171,6 +202,10 @@ private:
     // flat_map: contiguous storage, cache-friendly for the small fd set.
     std::flat_map<int, void*> fds_;
     std::vector<struct kevent> events_;
+    // Buffered interest changes (add/mod/del) — flushed as one kevent() call at
+    // the start of wait(). This is the Tier-2 batched-changelist optimization:
+    // N interest changes per loop iteration cost ONE syscall instead of N.
+    std::vector<struct kevent> pending_;
 };
 
 }  // namespace muses

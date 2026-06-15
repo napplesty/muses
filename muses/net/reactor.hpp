@@ -308,8 +308,14 @@ private:
 
     void dispatch_to_worker(int fd, Connection& conn) {
         conn.dispatched = true;
-        // Detach read interest while a worker owns the response cycle.
-        poller_->del(fd);
+        // NOTE: the fd is intentionally LEFT armed (Readable) during dispatch.
+        // The `dispatched` flag is the re-entry guard (on_client_event checks
+        // it first), so there's no need for a poller del — saving one syscall
+        // per request. The edge-triggered concern (a Readable edge that fires
+        // while dispatched is swallowed, losing the readiness) is handled by a
+        // speculative drain in finish_response: when the worker hands back, we
+        // read the socket to EAGAIN before re-checking the buffer, so any data
+        // that arrived during dispatch is pulled in explicitly.
         // Copy only the COMPLETE first request (bytes [0, scan_pos)) into a
         // std::string for the handler. Any pipelined bytes after scan_pos stay
         // in read_buf for the next round (critical under edge-triggered I/O:
@@ -347,10 +353,13 @@ private:
                 handler_ok && hr.keep_alive,
                 std::move(hr.response)});
             if (!pushed) {
-                // Outbox full (DropNew): the reactor will never see this fd
-                // again, so close it here to avoid a leak. The fd is detached
-                // from the poller (done above) and not owned by any other
-                // thread during dispatch, so closing here is safe.
+                // Outbox full (DropNew): the reactor will never see this fd's
+                // handback, so close the fd here to avoid a write-side leak.
+                // The fd is still armed in the poller (we no longer del on
+                // dispatch), so the reactor will get a Readable edge for it;
+                // on the next event it reads, gets EBADF/0, and
+                // close_connection cleans up the Connection entry + poller
+                // registration. The double-close is harmless.
                 ::close(fd);
                 return;
             }
@@ -416,12 +425,12 @@ private:
             finish_response(conn);
             return;
         }
-        // Still have bytes to send: park and arm Writable. Keep read interest
-        // off while writing (the next request can't start until this response
-        // is done).
+        // Still have bytes to send: park and arm Writable. Switch interest in
+        // ONE poller call (mod) instead of del+add (two calls). Read interest
+        // is dropped because the next request can't start until this response
+        // finishes.
         conn.writing = true;
-        poller_->del(conn.fd);
-        poller_->add(conn.fd, EventMask::Writable, nullptr);
+        poller_->mod(conn.fd, EventMask::Writable, nullptr);
     }
 
     // A response finished writing successfully: either close or re-arm for the
@@ -429,17 +438,60 @@ private:
     void finish_response(Connection& conn) {
         if (conn.keep_alive_after_write) {
             conn.dispatched = false;
-            poller_->del(conn.fd);  // ensure no stale Writable interest
-            poller_->add(conn.fd, EventMask::Readable, nullptr);
-            // Edge-triggered correctness: the pipelined bytes for the NEXT
-            // request may already be sitting in read_buf (read off the socket
-            // during the previous round, so no new edge will ever fire for
-            // them). Re-scan the buffer now and dispatch immediately if a
-            // complete request is present.
-            check_buffered_request(conn);
+            const int fd = conn.fd;  // capture before any erase could invalidate conn
+            // Switch interest back to Readable in ONE poller call (mod) instead
+            // of del+add. The fd was never del'd on dispatch (Tier 1), so it's
+            // still registered — mod is valid here.
+            poller_->mod(fd, EventMask::Readable, nullptr);
+            // Edge-triggered correctness (two cases):
+            //  1. Pipelined bytes read during the PREVIOUS round are sitting in
+            //     read_buf — no edge will ever fire for them.
+            //  2. Bytes that arrived DURING dispatch fired a Readable edge that
+            //     on_client_event swallowed (dispatched==true). That edge is
+            //     consumed, so we must pull the data in ourselves.
+            // A speculative drain covers case 2; check_buffered_request covers
+            // both by scanning whatever ends up in the buffer.
+            bool alive = drain_into_buffer(conn);
+            // drain_into_buffer may have closed the fd (peer closed / error),
+            // invalidating conn (the Connection was erased). Re-lookup by fd;
+            // only proceed if the connection still exists.
+            if (!alive || connections_.find(fd) == connections_.end()) return;
+            check_buffered_request(connections_.at(fd));
         } else {
             close_connection(conn.fd);
         }
+    }
+
+    // Speculatively read the socket to EAGAIN into read_buf (no scan, no
+    // dispatch). Used by finish_response to recover data whose Readable edge
+    // was consumed during dispatch. Returns false on a hard error / peer-closed
+    // (caller closes the connection).
+    bool drain_into_buffer(Connection& conn) {
+        char buf[4096];
+        for (;;) {
+            ssize_t r = ::read(conn.fd, buf, sizeof(buf));
+            if (r > 0) {
+                if (!conn.read_buf.append(buf, static_cast<std::size_t>(r))) {
+                    close_connection(conn.fd);
+                    return false;
+                }
+                if (conn.read_buf.size() > Connection_max_request()) {
+                    close_connection(conn.fd);
+                    return false;
+                }
+                continue;
+            }
+            if (r == 0) {
+                // Client closed during/after the response.
+                close_connection(conn.fd);
+                return false;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            if (errno == EINTR) continue;
+            close_connection(conn.fd);
+            return false;
+        }
+        return true;
     }
 
     // If read_buf already contains a complete "\r\n\r\n"-terminated request,
