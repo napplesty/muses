@@ -146,13 +146,17 @@ public:
 
 private:
     bool apply(int fd, EventMask mask, uint16_t kflags) {
+        // EV_CLEAR makes all socket filters edge-triggered: the reactor gets
+        // one event per state transition and must drain read/write/accept to
+        // EAGAIN. This cuts the number of kevent syscalls under load.
+        const uint16_t et_flags = kflags | EV_CLEAR;
         struct kevent changes[2];
         int n = 0;
         if (has(mask, EventMask::Readable)) {
-            EV_SET(&changes[n++], fd, EVFILT_READ, kflags, 0, 0, nullptr);
+            EV_SET(&changes[n++], fd, EVFILT_READ, et_flags, 0, 0, nullptr);
         }
         if (has(mask, EventMask::Writable)) {
-            EV_SET(&changes[n++], fd, EVFILT_WRITE, kflags, 0, 0, nullptr);
+            EV_SET(&changes[n++], fd, EVFILT_WRITE, et_flags, 0, 0, nullptr);
         }
         if (n == 0) return true;
         if (::kevent(kq_, changes, n, nullptr, 0, nullptr) == -1) {

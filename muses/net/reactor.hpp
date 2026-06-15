@@ -167,7 +167,13 @@ private:
     }
 
     void accept_all() {
-        for (;;) {
+        // Cap accepts per call so a connection storm can't starve servicing of
+        // existing connections. Under edge-triggered I/O the listen fd is
+        // drained to EAGAIN; remaining pending connections re-edge on the next
+        // accept batch. 128 is large enough to amortize the kevent/epoll_wait
+        // wakeup while bounding per-iteration work.
+        constexpr int kAcceptBatch = 128;
+        for (int accepted = 0; accepted < kAcceptBatch; ++accepted) {
             sockaddr_in addr{};
             socklen_t len = sizeof(addr);
             int fd = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
@@ -216,6 +222,7 @@ private:
         if (conn.dispatched) return;  // already being processed
 
         char buf[4096];
+        bool got_complete = false;  // saw a "\r\n\r\n" this round
         for (;;) {
             ssize_t r = ::read(fd, buf, sizeof(buf));
             if (r > 0) {
@@ -261,10 +268,17 @@ private:
                 if (found != nullptr) {
                     std::size_t hit_off = static_cast<std::size_t>(found - base);
                     conn.read_buf.set_scan_pos(hit_off + needle_len);
-                    // Complete request: hand off to a worker. Detach from the
-                    // poller while in flight to avoid re-entry.
-                    dispatch_to_worker(fd, conn);
-                    return;
+                    got_complete = true;
+                    // IMPORTANT (edge-triggered): keep draining the socket to
+                    // EAGAIN before dispatching. Any pipelined bytes for the
+                    // NEXT request are already in the socket buffer; if we
+                    // dispatch now and return, those bytes are consumed from
+                    // the kernel but never re-edge under ET. By continuing the
+                    // read loop we pull them into read_buf; dispatch_to_worker
+                    // then carves off only the first request and leaves the
+                    // rest, which finish_response re-checks after the worker
+                    // returns.
+                    continue;
                 }
                 // Not yet complete: advance scan_pos to just past the new tail
                 // (minus the overlap) so the next read resumes the search.
@@ -272,7 +286,7 @@ private:
                     conn.read_buf.size() >= (needle_len - 1)
                         ? conn.read_buf.size() - (needle_len - 1)
                         : 0);
-                continue;  // keep draining (level-triggered)
+                continue;  // keep draining
             }
             if (r == 0) {
                 // Client closed.
@@ -285,19 +299,35 @@ private:
             close_connection(fd);
             return;
         }
+        // Socket drained to EAGAIN. If we saw a complete request, dispatch it
+        // now (with any pipelined bytes safely buffered in read_buf).
+        if (got_complete) {
+            dispatch_to_worker(fd, conn);
+        }
     }
 
     void dispatch_to_worker(int fd, Connection& conn) {
         conn.dispatched = true;
         // Detach read interest while a worker owns the response cycle.
         poller_->del(fd);
-        // Copy the accumulated request bytes into a std::string for the
-        // handler (its API takes const std::string&), then reset the pooled
-        // buffer for the NEXT request on this connection — keep_alive reuses
-        // the same pool block (reset_for_reuse does not release it).
-        std::string request(static_cast<const char*>(conn.read_buf.data()),
-                            conn.read_buf.size());
-        conn.read_buf.reset_for_reuse();
+        // Copy only the COMPLETE first request (bytes [0, scan_pos)) into a
+        // std::string for the handler. Any pipelined bytes after scan_pos stay
+        // in read_buf for the next round (critical under edge-triggered I/O:
+        // those bytes were already read off the socket, so no new edge will
+        // fire for them — finish_response must re-check the buffer).
+        std::size_t req_len = conn.read_buf.scan_pos();
+        if (req_len == 0) req_len = conn.read_buf.size();
+        std::string request(static_cast<const char*>(conn.read_buf.data()), req_len);
+        // Shift the leftover pipelined bytes to the front of the buffer and
+        // reset scan_pos so the next scan starts fresh.
+        std::size_t leftover = conn.read_buf.size() - req_len;
+        if (leftover > 0 && req_len > 0) {
+            std::memmove(conn.read_buf.data(),
+                         static_cast<const char*>(conn.read_buf.data()) + req_len,
+                         leftover);
+        }
+        conn.read_buf.set_size(leftover);
+        conn.read_buf.set_scan_pos(0);
         // Capture handler_ by reference (stable for the reactor's lifetime).
         workers_.enqueue([this, fd, request = std::move(request)]() mutable {
             HandlerResult hr;
@@ -399,12 +429,37 @@ private:
     void finish_response(Connection& conn) {
         if (conn.keep_alive_after_write) {
             conn.dispatched = false;
-            conn.read_buf.reset_for_reuse();
             poller_->del(conn.fd);  // ensure no stale Writable interest
             poller_->add(conn.fd, EventMask::Readable, nullptr);
+            // Edge-triggered correctness: the pipelined bytes for the NEXT
+            // request may already be sitting in read_buf (read off the socket
+            // during the previous round, so no new edge will ever fire for
+            // them). Re-scan the buffer now and dispatch immediately if a
+            // complete request is present.
+            check_buffered_request(conn);
         } else {
             close_connection(conn.fd);
         }
+    }
+
+    // If read_buf already contains a complete "\r\n\r\n"-terminated request,
+    // dispatch it without waiting for a poller event. This is mandatory under
+    // edge-triggered I/O: bytes already consumed from the socket won't produce
+    // a new readiness edge. Returns true if a request was dispatched.
+    bool check_buffered_request(Connection& conn) {
+        if (conn.dispatched) return false;
+        if (conn.read_buf.size() < 4) return false;
+        const char* base = static_cast<const char*>(conn.read_buf.data());
+        std::size_t n = conn.read_buf.size();
+        for (std::size_t i = 0; i + 4 <= n; ++i) {
+            if (base[i] == '\r' && base[i + 1] == '\n' &&
+                base[i + 2] == '\r' && base[i + 3] == '\n') {
+                conn.read_buf.set_scan_pos(i + 4);
+                dispatch_to_worker(conn.fd, conn);
+                return true;
+            }
+        }
+        return false;
     }
 
     void drain_outbox() {
@@ -453,6 +508,71 @@ private:
     std::flat_map<int, Connection> connections_;
 };
 
+// A pool of independent Reactor shards sharing one listen fd. SO_REUSEPORT
+// (set in TCPListener) lets the kernel hand each incoming connection to exactly
+// one shard; that shard owns the fd for its whole lifetime — it appears in that
+// shard's connections_, is served by that shard's worker pool, and its response
+// handback routes back through that shard's outbox. No cross-shard routing or
+// locking is needed.
+//
+// Each shard has its own poller, MemoryPool, outbox, connections map, and a
+// private worker pool (workers_per_shard threads). This is the multi-core
+// scaling story: N shards → N reactor threads doing I/O in parallel, with N×W
+// worker threads for compute. For static-file serving (near-zero compute) the
+// win is the N parallel I/O loops; the per-shard worker count can stay small.
+class ReactorPool {
+public:
+    // shard_count reactors; each runs workers_per_shard worker threads.
+    ReactorPool(int listen_fd, RequestHandler handler,
+                unsigned shard_count, unsigned workers_per_shard,
+                std::size_t outbox_capacity = 1024)
+    : listen_fd_(listen_fd),
+      handler_(std::move(handler)),
+      workers_per_shard_(workers_per_shard == 0 ? 1 : workers_per_shard),
+      outbox_capacity_(outbox_capacity) {
+        if (shard_count == 0) shard_count = 1;
+        shards_.reserve(shard_count);
+        for (unsigned i = 0; i < shard_count; ++i) {
+            // Each shard gets its own Reactor with an independent worker pool.
+            // The RequestHandler is copied into each shard (it's a
+            // std::function; the typical handler is stateless/captures by ref
+            // to long-lived state, so copying is cheap and safe).
+            shards_.push_back(std::make_unique<Reactor>(
+                listen_fd_, handler_, workers_per_shard_, outbox_capacity_));
+        }
+    }
+
+    ~ReactorPool() { stop(); }
+
+    ReactorPool(const ReactorPool&) = delete;
+    ReactorPool& operator=(const ReactorPool&) = delete;
+
+    void start() {
+        if (started_.exchange(true)) return;
+        for (auto& shard : shards_) shard->start();
+        MUSES_INFO(std::format("ReactorPool started: {} shards x {} workers",
+                               shards_.size(), workers_per_shard_));
+    }
+
+    void stop() {
+        if (!started_.exchange(false)) return;
+        // Stop in reverse order (cosmetic; each shard is independent).
+        for (auto it = shards_.rbegin(); it != shards_.rend(); ++it) {
+            (*it)->stop();
+        }
+    }
+
+    std::size_t shard_count() const { return shards_.size(); }
+
+private:
+    int listen_fd_;
+    RequestHandler handler_;
+    unsigned workers_per_shard_;
+    std::size_t outbox_capacity_;
+    std::vector<std::unique_ptr<Reactor>> shards_;
+    std::atomic<bool> started_{false};
+};
+
 // Convenience: a simple synchronous TCP listener wrapping bind/listen.
 class TCPListener {
 public:
@@ -477,6 +597,15 @@ public:
         }
         int opt = 1;
         ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        // SO_REUSEPORT lets multiple sockets (one per reactor shard) bind the
+        // same port and each accept independently; the kernel load-balances
+        // incoming connections across them. Required for the multi-reactor
+        // (sharded) deployment. Failure here is non-fatal — single-reactor use
+        // works without it — but log so a missing-shard scenario is diagnosable.
+        if (::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+            MUSES_WARNING(std::format("TCPListener: SO_REUSEPORT failed (multi-reactor will not work): {}",
+                                      std::strerror(errno)));
+        }
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = ::inet_addr(ip_.c_str());

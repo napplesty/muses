@@ -3,9 +3,15 @@
 // Run from the build directory (where tests/statics has been copied):
 //   ./muses_http_server
 // Env vars:
-//   MUSES_WORKERS  number of worker threads (default 4)
-//   MUSES_PORT     listen port (default 8864)
+//   MUSES_REACTORS  number of reactor shards (default: hardware_concurrency())
+//   MUSES_WORKERS   worker threads PER shard (default 4)
+//   MUSES_PORT      listen port (default 8864)
 // Then: curl http://127.0.0.1:8864/
+//
+// Multi-reactor: each shard is an independent reactor thread with its own
+// poller, worker pool, and connection map, all sharing the one listen fd via
+// SO_REUSEPORT (the kernel hands each incoming connection to exactly one
+// shard). This is how muses scales across cores.
 
 #include "muses/logging.hpp"
 #include "muses/net/reactor.hpp"
@@ -18,14 +24,18 @@
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
+#include <thread>
 
 static std::atomic<bool> g_stop{false};
 
 int main() {
     std::signal(SIGINT, [](int) { g_stop.store(true); });
 
-    unsigned workers = 4;
-    if (const char* w = std::getenv("MUSES_WORKERS")) workers = static_cast<unsigned>(std::atoi(w));
+    unsigned reactors = std::thread::hardware_concurrency();
+    if (reactors == 0) reactors = 4;
+    if (const char* r = std::getenv("MUSES_REACTORS")) reactors = static_cast<unsigned>(std::atoi(r));
+    unsigned workers_per_shard = 4;
+    if (const char* w = std::getenv("MUSES_WORKERS")) workers_per_shard = static_cast<unsigned>(std::atoi(w));
     unsigned short port = 8864;
     if (const char* p = std::getenv("MUSES_PORT")) port = static_cast<unsigned short>(std::atoi(p));
 
@@ -37,19 +47,20 @@ int main() {
     }
     int lfd = *lfd_result;
 
-    muses::Reactor reactor(lfd, [](const std::string& req) -> muses::HandlerResult {
+    muses::ReactorPool pool(lfd, [](const std::string& req) -> muses::HandlerResult {
         auto hr = muses::HttpContext::handle_request(req);
         return muses::HandlerResult{std::move(hr.response), hr.keep_alive};
-    }, workers);
-    reactor.start();
+    }, reactors, workers_per_shard);
+    pool.start();
 
     std::cout << "serving ./statics on http://127.0.0.1:" << port
-              << "/ (workers=" << workers << ", Ctrl-C to quit)\n";
+              << "/ (reactors=" << pool.shard_count()
+              << ", workers/shard=" << workers_per_shard
+              << ", Ctrl-C to quit)\n";
     while (!g_stop.load()) {
         sleep(1);
     }
 
-    reactor.stop();
+    pool.stop();
     return 0;
 }
-

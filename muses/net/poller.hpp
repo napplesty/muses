@@ -57,9 +57,12 @@ struct PollEvent {
 };
 
 // Abstract reactor-side multiplexer. Implementations wrap kqueue (macOS) or
-// epoll (Linux). All fds are expected to be non-blocking; level semantics are
-// used for portability. wakeup() lets another thread interrupt a blocked
-// wait() (used by the reactor to process worker handback via an outbox).
+// epoll (Linux). All fds are expected to be non-blocking and are registered
+// EDGE-TRIGGERED (kqueue EV_CLEAR / epoll EPOLLET): the reactor gets one event
+// per state transition and MUST drain read/write/accept loops to EAGAIN,
+// otherwise readiness is lost. wakeup() lets another thread interrupt a
+// blocked wait() (used by the reactor to process worker handback via an
+// outbox).
 class Poller {
 public:
     virtual ~Poller() = default;

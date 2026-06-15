@@ -147,6 +147,10 @@ private:
         uint32_t e = 0;
         if (has(m, EventMask::Readable)) e |= EPOLLIN;
         if (has(m, EventMask::Writable)) e |= EPOLLOUT;
+        // EPOLLET makes all registrations edge-triggered: the reactor gets one
+        // event per state transition and must drain read/write/accept to
+        // EAGAIN. Cuts epoll_wait re-notifications under load.
+        e |= EPOLLET;
         return e;
     }
 

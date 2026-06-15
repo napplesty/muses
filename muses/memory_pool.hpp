@@ -490,6 +490,12 @@ public:
         scan_pos_ = 0;
     }
 
+    // Set the live length directly. Used after manually shifting bytes in the
+    // buffer (e.g. discarding a consumed request and compacting the leftover
+    // pipelined bytes to the front). Caller is responsible for only shrinking
+    // or having written valid data into [0, n).
+    void set_size(std::size_t n) { len_ = n; }
+
     void* data() { return data_; }
     const void* data() const { return data_; }
     std::size_t size() const { return len_; }

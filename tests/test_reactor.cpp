@@ -10,6 +10,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -227,4 +228,74 @@ TEST_CASE("Reactor: keep-alive reuses one socket for two requests") {
     reactor.stop();
     ::close(lfd);
     std::remove("./statics/rr_keep.html");
+}
+
+// Pipelined requests: two requests sent in ONE write, back-to-back, on the
+// same keep-alive connection. This is the critical edge-triggered correctness
+// test — after the first request is dispatched, the second's bytes are already
+// in the socket buffer. Under ET the reactor must drain them into read_buf and
+// re-dispatch via check_buffered_request; otherwise the second response hangs.
+TEST_CASE("Reactor: pipelined requests both answered (ET correctness)") {
+    unsigned short port = 0;
+    int lfd = make_listen_socket(port);
+    REQUIRE(lfd >= 0);
+
+    std::ofstream("./statics/rr_pipe.html") << "pipeline-body";
+
+    muses::Reactor reactor(lfd, [](const std::string& req) -> muses::HandlerResult {
+        auto hr = muses::HttpContext::handle_request(req);
+        return muses::HandlerResult{std::move(hr.response), hr.keep_alive};
+    }, 2);
+    reactor.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+
+    int fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    REQUIRE(fd >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
+    addr.sin_port = htons(port);
+    REQUIRE(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+
+    // Send TWO complete requests in a single write (pipelined).
+    std::string pipelined =
+        "GET /rr_pipe.html HTTP/1.1\r\n"
+        "\r\n"
+        "GET /rr_pipe.html HTTP/1.1\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ssize_t w = ::write(fd, pipelined.data(), pipelined.size());
+    REQUIRE(w == static_cast<ssize_t>(pipelined.size()));
+
+    // Read until we see BOTH response bodies (or timeout).
+    std::string out;
+    char buf[4096];
+    for (int i = 0; i < 200 && (std::count(out.begin(), out.end(), 'p') < 2 ||
+                                out.find("pipeline-body", out.find("pipeline-body") + 1) == std::string::npos); ++i) {
+        timeval tv{0, 100 * 1000};
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ssize_t r = ::read(fd, buf, sizeof(buf));
+        if (r > 0) out.append(buf, static_cast<std::size_t>(r));
+        else if (r == 0) break;
+    }
+
+    // Both responses must have arrived on the one socket.
+    std::size_t first_body = out.find("pipeline-body");
+    CHECK(first_body != std::string::npos);
+    if (first_body != std::string::npos) {
+        std::size_t second_body = out.find("pipeline-body", first_body + 1);
+        CHECK(second_body != std::string::npos);  // two bodies received
+    }
+    // At least two "HTTP/1.1 200" status lines.
+    std::size_t first_status = out.find("HTTP/1.1 200");
+    CHECK(first_status != std::string::npos);
+    if (first_status != std::string::npos) {
+        CHECK(out.find("HTTP/1.1 200", first_status + 1) != std::string::npos);
+    }
+
+    ::close(fd);
+    reactor.stop();
+    ::close(lfd);
+    std::remove("./statics/rr_pipe.html");
 }
