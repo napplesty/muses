@@ -53,7 +53,10 @@ namespace muses {
 // on the reactor thread), so no locking is required to touch these fields.
 struct Connection {
     int fd;
-    std::string read_buf;
+    // Read buffer backed by the reactor's MemoryPool. Reused across keep-alive
+    // requests on the same connection (reset_for_reuse keeps the block), so N
+    // pipelined requests cost ~1 pool allocation instead of N malloc/free.
+    PooledBuffer read_buf;
     bool dispatched = false;  // true while a worker is processing this fd
 };
 
@@ -165,6 +168,9 @@ private:
             set_nonblocking(fd);
             Connection conn;
             conn.fd = fd;
+            // Allocate the read buffer from the reactor's pool (4096-slot size
+            // class). Reused across keep-alive requests on this connection.
+            conn.read_buf = PooledBuffer(pool_, 4096);
             connections_.emplace(fd, std::move(conn));
             if (!poller_->add(fd, EventMask::Readable, nullptr)) {
                 MUSES_ERROR("Reactor: poller add client failed");
@@ -191,18 +197,59 @@ private:
         for (;;) {
             ssize_t r = ::read(fd, buf, sizeof(buf));
             if (r > 0) {
-                conn.read_buf.append(buf, static_cast<std::size_t>(r));
+                std::size_t prev_len = conn.read_buf.size();
+                if (!conn.read_buf.append(buf, static_cast<std::size_t>(r))) {
+                    // Pool allocation failure on grow; drop the connection.
+                    close_connection(fd);
+                    return;
+                }
                 if (conn.read_buf.size() > Connection_max_request()) {
                     // Oversized; drop the connection.
                     close_connection(fd);
                     return;
                 }
-                if (conn.read_buf.find("\r\n\r\n") != std::string::npos) {
+                // Incremental end-of-headers scan: only look at newly-arrived
+                // bytes plus a 3-byte overlap with the prior tail, so a
+                // "\r\n\r\n" straddling the old/new boundary is still found.
+                // This replaces a full-buffer find() on every read (O(n²) when
+                // a request arrives in many small packets).
+                const std::size_t needle_len = 4;
+                const char* base = static_cast<const char*>(conn.read_buf.data());
+                std::size_t scan_from = prev_len >= (needle_len - 1)
+                    ? prev_len - (needle_len - 1)
+                    : 0;
+                if (scan_from < conn.read_buf.scan_pos()) {
+                    scan_from = conn.read_buf.scan_pos();
+                }
+                // Search [scan_from, size) for "\r\n\r\n". Inlined (no memmem
+                // dependency) — short needle, hot path.
+                std::size_t search_len = conn.read_buf.size() - scan_from;
+                const char* found = nullptr;
+                if (search_len >= needle_len) {
+                    for (std::size_t i = 0; i + needle_len <= search_len; ++i) {
+                        if (base[scan_from + i] == '\r' &&
+                            base[scan_from + i + 1] == '\n' &&
+                            base[scan_from + i + 2] == '\r' &&
+                            base[scan_from + i + 3] == '\n') {
+                            found = base + scan_from + i;
+                            break;
+                        }
+                    }
+                }
+                if (found != nullptr) {
+                    std::size_t hit_off = static_cast<std::size_t>(found - base);
+                    conn.read_buf.set_scan_pos(hit_off + needle_len);
                     // Complete request: hand off to a worker. Detach from the
                     // poller while in flight to avoid re-entry.
                     dispatch_to_worker(fd, conn);
                     return;
                 }
+                // Not yet complete: advance scan_pos to just past the new tail
+                // (minus the overlap) so the next read resumes the search.
+                conn.read_buf.set_scan_pos(
+                    conn.read_buf.size() >= (needle_len - 1)
+                        ? conn.read_buf.size() - (needle_len - 1)
+                        : 0);
                 continue;  // keep draining (level-triggered)
             }
             if (r == 0) {
@@ -222,8 +269,13 @@ private:
         conn.dispatched = true;
         // Detach read interest while a worker owns the response cycle.
         poller_->del(fd);
-        std::string request = std::move(conn.read_buf);
-        conn.read_buf.clear();
+        // Copy the accumulated request bytes into a std::string for the
+        // handler (its API takes const std::string&), then reset the pooled
+        // buffer for the NEXT request on this connection — keep_alive reuses
+        // the same pool block (reset_for_reuse does not release it).
+        std::string request(static_cast<const char*>(conn.read_buf.data()),
+                            conn.read_buf.size());
+        conn.read_buf.reset_for_reuse();
         // Capture handler_ by reference (stable for the reactor's lifetime).
         workers_.enqueue([this, fd, request = std::move(request)]() mutable {
             HandlerResult hr;
@@ -272,8 +324,11 @@ private:
             if (it == connections_.end()) continue;
             if (hb.ok && hb.keep_alive) {
                 // Re-arm the fd for the next request on the same connection.
+                // read_buf was already reset_for_reuse() at dispatch time;
+                // ensure it's clean in case the worker saw a partial next
+                // request (defensive — the fd was detached during dispatch).
                 it->second.dispatched = false;
-                it->second.read_buf.clear();
+                it->second.read_buf.reset_for_reuse();
                 poller_->add(hb.fd, EventMask::Readable, nullptr);
             } else {
                 close_connection(hb.fd);
@@ -298,6 +353,11 @@ private:
     std::unique_ptr<Poller> poller_;
     std::thread reactor_thread_;
     std::atomic<bool> running_;
+    // Memory pool backing Connection::read_buf. Owned by the reactor, touched
+    // only on the reactor thread (single-threaded use → bin mutexes never
+    // contend). Wiring the pool onto a real hot path; a thread-local cache
+    // layer can be layered on later if this ever goes multi-threaded.
+    MemoryPool pool_;
     // Reactor-thread-only state (no lock needed). flat_map keeps the active
     // connection set in a contiguous array — better cache locality than a
     // node-based unordered_map for the typically-small fd set.

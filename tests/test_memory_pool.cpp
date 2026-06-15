@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -141,4 +142,135 @@ TEST_CASE("MemoryPool: no cross-talk between allocations") {
     }
     pool.release(a);
     pool.release(b);
+}
+
+// A block allocated on thread A can be released on thread B. This is the key
+// contract for any future thread-local cache layer: since the size class lives
+// in the BlockHeader (not in thread state), release() always routes the block
+// back to the correct global bin regardless of which thread frees it.
+TEST_CASE("MemoryPool: cross-thread allocate/release") {
+    muses::MemoryPool pool;
+    constexpr int N_THREADS = 8;
+    constexpr int PER = 2000;
+    std::vector<std::thread> threads;
+    std::atomic<int> errors{0};
+
+    // Each thread allocates PER blocks and hands them to a shared list; a
+    // single reaper thread releases them all (cross-thread frees).
+    std::mutex mu;
+    std::vector<void*> pending;
+    std::atomic<int> allocated{0};
+    std::atomic<bool> done{false};
+
+    std::thread reaper([&] {
+        for (;;) {
+            std::vector<void*> grab;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                grab.swap(pending);
+            }
+            for (void* p : grab) pool.release(p);
+            // Exit only once all allocators are done AND the shared list is
+            // drained. Re-check pending under the lock to avoid racing with a
+            // producer that pushes between our swap and the empty() read.
+            bool can_stop;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                can_stop = done.load(std::memory_order_acquire) && pending.empty();
+            }
+            if (can_stop) break;
+            std::this_thread::yield();
+        }
+    });
+
+    for (int t = 0; t < N_THREADS; ++t) {
+        threads.emplace_back([&] {
+            for (int i = 0; i < PER; ++i) {
+                void* p = pool.allocate(1 + (i % 200));
+                if (p == nullptr) { errors.fetch_add(1); continue; }
+                std::memset(p, 0xAB, 1 + (i % 200));  // touch to catch overlap
+                allocated.fetch_add(1, std::memory_order_relaxed);
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    pending.push_back(p);
+                }
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    done.store(true, std::memory_order_release);
+    reaper.join();
+    // Defensive: after the reaper is joined, drain anything that slipped
+    // through (shouldn't happen, but makes the live==0 assertion robust).
+    std::vector<void*> leftover;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        leftover.swap(pending);
+    }
+    for (void* p : leftover) pool.release(p);
+
+    CHECK(errors.load() == 0);
+    CHECK(allocated.load() == N_THREADS * PER);
+    CHECK(pool.stats().live == 0);  // all released back
+}
+
+// PooledBuffer: grow, reuse, and the keep-alive reset pattern.
+TEST_CASE("PooledBuffer: append, grow, reset_for_reuse keeps capacity") {
+    muses::MemoryPool pool;
+    muses::PooledBuffer buf(pool, 64);
+    CHECK(buf.capacity() >= 64);
+    CHECK(buf.empty());
+
+    // Fill exactly to capacity (no grow).
+    std::string chunk(64, 'A');
+    CHECK(buf.append(chunk.data(), chunk.size()));
+    CHECK(buf.size() == 64);
+    CHECK(buf.capacity() == 64);
+
+    // Append beyond capacity → grow.
+    CHECK(buf.append("HELLO", 5));
+    CHECK(buf.size() == 69);
+    CHECK(buf.capacity() >= 69);
+    // Contents preserved across the grow.
+    const char* d = static_cast<const char*>(buf.data());
+    CHECK(d[0] == 'A');
+    CHECK(d[63] == 'A');
+    CHECK(d[64] == 'H');
+
+    // Reset for the next request on the same connection: length and scan_pos
+    // clear, but capacity is retained (block reuse).
+    buf.reset_for_reuse();
+    CHECK(buf.size() == 0);
+    CHECK(buf.scan_pos() == 0);
+    CHECK(buf.capacity() >= 69);  // block retained
+
+    // Re-append works after reset.
+    CHECK(buf.append("world", 5));
+    CHECK(buf.size() == 5);
+    CHECK(static_cast<const char*>(buf.data())[0] == 'w');
+}
+
+// PooledBuffer: scan_pos bookkeeping (caller-managed delimiter cursor).
+TEST_CASE("PooledBuffer: scan_pos get/set") {
+    muses::MemoryPool pool;
+    muses::PooledBuffer buf(pool, 128);
+    CHECK(buf.scan_pos() == 0);
+    buf.set_scan_pos(42);
+    CHECK(buf.scan_pos() == 42);
+    buf.reset_for_reuse();
+    CHECK(buf.scan_pos() == 0);
+}
+
+// PooledBuffer: move transfers ownership; source is empty.
+TEST_CASE("PooledBuffer: move semantics") {
+    muses::MemoryPool pool;
+    muses::PooledBuffer a(pool, 128);
+    a.append("data", 4);
+    std::size_t cap_before = a.capacity();
+    muses::PooledBuffer b(std::move(a));
+    CHECK(a.data() == nullptr);
+    CHECK(b.size() == 4);
+    CHECK(b.capacity() == cap_before);
+    CHECK(static_cast<const char*>(b.data())[0] == 'd');
+    // b's destructor releases the block back to the pool.
 }

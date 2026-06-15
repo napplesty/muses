@@ -391,6 +391,134 @@ void destroy_pool(PoolPtr<T>& p) {
     }
 }
 
+// A growable byte buffer backed by a MemoryPool allocation. Designed for
+// per-connection read buffers that are reused across many requests on the same
+// connection (HTTP keep-alive): each request resets len() to 0 but keeps the
+// underlying block, so N requests cost ~1 pool allocation instead of N
+// malloc/free cycles.
+//
+// Lifetime: owns one pool block (raw void*, refcount 1) via the pool. On grow,
+// if the new size exceeds the current block's slot size, the old block is
+// released and a larger one allocated (the pool's ESCAPED path handles sizes
+// beyond the largest class). On destruction the block is released back.
+//
+// scan_pos() is the caller's bookkeeping for incremental delimiter search
+// (avoids re-scanning the whole buffer on every read); PooledBuffer just
+// stores and exposes it.
+class PooledBuffer {
+public:
+    PooledBuffer() = default;
+
+    explicit PooledBuffer(MemoryPool& pool, std::size_t initial_cap = 4096)
+    : pool_(&pool) {
+        reserve(initial_cap);
+    }
+
+    // Non-copyable (owns a pool allocation); movable.
+    PooledBuffer(const PooledBuffer&) = delete;
+    PooledBuffer& operator=(const PooledBuffer&) = delete;
+
+    PooledBuffer(PooledBuffer&& o) noexcept
+    : pool_(o.pool_), data_(o.data_), cap_(o.cap_), len_(o.len_),
+      scan_pos_(o.scan_pos_) {
+        o.pool_ = nullptr;
+        o.data_ = nullptr;
+        o.cap_ = 0;
+        o.len_ = 0;
+        o.scan_pos_ = 0;
+    }
+
+    PooledBuffer& operator=(PooledBuffer&& o) noexcept {
+        if (this != &o) {
+            release_pool_block();
+            len_ = 0;
+            scan_pos_ = 0;
+            pool_ = o.pool_;
+            data_ = o.data_;
+            cap_ = o.cap_;
+            len_ = o.len_;
+            scan_pos_ = o.scan_pos_;
+            o.pool_ = nullptr;
+            o.data_ = nullptr;
+            o.cap_ = 0;
+            o.len_ = 0;
+            o.scan_pos_ = 0;
+        }
+        return *this;
+    }
+
+    ~PooledBuffer() { release_pool_block(); }
+
+    // Ensure at least `need` bytes of usable capacity. Reallocates via the
+    // pool (release old, allocate new) only when growing past the current slot.
+    void reserve(std::size_t need) {
+        if (need <= cap_) return;
+        // Allocate the new (larger) block first, copy, then release the old.
+        void* fresh = pool_->allocate(need);
+        if (fresh == nullptr) return;  // allocation failed; keep old block
+        // Copy live data over before releasing the old block. We save len_
+        // because release_pool_block() zeroes it.
+        std::size_t saved_len = len_;
+        if (data_ != nullptr && saved_len > 0) {
+            std::memcpy(fresh, data_, saved_len);
+        }
+        release_pool_block();
+        data_ = static_cast<std::byte*>(fresh);
+        cap_ = need;
+        len_ = saved_len;
+    }
+
+    // Append bytes, growing if necessary. Returns false on allocation failure.
+    bool append(const void* src, std::size_t n) {
+        if (len_ + n > cap_) {
+            // Grow geometrically to amortize, but never smaller than what's
+            // needed.
+            std::size_t newcap = cap_ == 0 ? 4096 : cap_;
+            while (newcap < len_ + n) newcap *= 2;
+            reserve(newcap);
+            if (len_ + n > cap_) return false;  // grow failed
+        }
+        std::memcpy(static_cast<std::byte*>(data_) + len_, src, n);
+        len_ += n;
+        return true;
+    }
+
+    // Reset for reuse on the same connection (keep the block). Clears length
+    // and the scan position.
+    void reset_for_reuse() {
+        len_ = 0;
+        scan_pos_ = 0;
+    }
+
+    void* data() { return data_; }
+    const void* data() const { return data_; }
+    std::size_t size() const { return len_; }
+    std::size_t capacity() const { return cap_; }
+    bool empty() const { return len_ == 0; }
+
+    std::size_t scan_pos() const { return scan_pos_; }
+    void set_scan_pos(std::size_t p) { scan_pos_ = p; }
+
+    explicit operator bool() const { return data_ != nullptr; }
+
+private:
+    // Return the current block to its pool free-list and forget it. Does NOT
+    // touch len_/scan_pos_ — callers (reserve, move, destructor) manage those.
+    void release_pool_block() {
+        if (pool_ && data_) {
+            pool_->release(data_);
+        }
+        data_ = nullptr;
+        cap_ = 0;
+    }
+
+    MemoryPool* pool_ = nullptr;
+    void* data_ = nullptr;   // usable region (pool allocate returns this)
+    std::size_t cap_ = 0;    // usable bytes available at data_
+    std::size_t len_ = 0;    // bytes currently filled
+    std::size_t scan_pos_ = 0;  // caller-managed delimiter scan cursor
+};
+
 }  // namespace muses
 
 #endif  // MUSES_MEMORY_POOL_HPP
