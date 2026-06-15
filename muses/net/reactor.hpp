@@ -58,6 +58,14 @@ struct Connection {
     // pipelined requests cost ~1 pool allocation instead of N malloc/free.
     PooledBuffer read_buf;
     bool dispatched = false;  // true while a worker is processing this fd
+    // --- Asynchronous write state (reactor-thread-only) ---
+    // When a response can't be fully written in one go (EAGAIN on a full send
+    // buffer), the remainder is parked here and the fd is armed for Writable
+    // so the reactor drains it incrementally. Empty/!writing means idle.
+    std::string write_buf;    // remaining response bytes to send
+    std::size_t write_off = 0;  // next byte to write within write_buf
+    bool keep_alive_after_write = false;  // keep-alive decision for this response
+    bool writing = false;     // true while a partial write is parked
 };
 
 // The reactor owns all fd I/O decisions; worker threads do the heavy compute
@@ -75,11 +83,15 @@ struct HandlerResult {
 
 using RequestHandler = std::function<HandlerResult(const std::string& request)>;
 
-// What a worker hands back to the reactor via the outbox.
+// What a worker hands back to the reactor via the outbox. The worker computes
+// the response and returns it; the reactor (which owns the fd and the poller)
+// does the actual non-blocking write. This keeps the write on the reactor
+// thread so a full send buffer parks the response on the Connection instead of
+// burning a worker core in a busy write loop.
 struct WorkerHandback {
     int fd;
-    bool keep_alive;  // reactor re-arms the fd if true
-    bool ok;          // false → close the connection
+    bool keep_alive;       // reactor re-arms the fd for reading if true
+    std::string response;  // bytes the reactor must write to the fd
 };
 
 class Reactor {
@@ -186,6 +198,16 @@ private:
             close_connection(fd);
             return;
         }
+        // Async write drain: a prior response parked its remainder on the
+        // connection; the fd is now writable again.
+        if (has(ev.mask, EventMask::Writable)) {
+            auto it = connections_.find(fd);
+            if (it != connections_.end() && it->second.writing) {
+                continue_write(it->second);
+            }
+            // Note: a Writable event with no parked write is unexpected; ignore.
+            return;
+        }
         if (!has(ev.mask, EventMask::Readable)) return;
 
         auto it = connections_.find(fd);
@@ -279,42 +301,110 @@ private:
         // Capture handler_ by reference (stable for the reactor's lifetime).
         workers_.enqueue([this, fd, request = std::move(request)]() mutable {
             HandlerResult hr;
+            bool handler_ok = true;
             try {
                 hr = handler_(request);
             } catch (const std::exception& e) {
                 MUSES_ERROR(std::string("handler threw: ") + e.what());
                 hr.keep_alive = false;
-                outbox_.push(WorkerHandback{fd, false, false});
-                // Wake the reactor so it drains the outbox promptly instead of
-                // waiting for the next poller timeout (which would add up to
-                // 100ms of latency per keep-alive request).
-                poller_->wakeup();
+                handler_ok = false;
+            }
+            // Hand the response bytes (empty on handler failure) to the
+            // reactor; the reactor does the write on its own thread. This
+            // avoids the old busy-spin in write_all() on EAGAIN.
+            bool pushed = outbox_.push(WorkerHandback{
+                fd,
+                handler_ok && hr.keep_alive,
+                std::move(hr.response)});
+            if (!pushed) {
+                // Outbox full (DropNew): the reactor will never see this fd
+                // again, so close it here to avoid a leak. The fd is detached
+                // from the poller (done above) and not owned by any other
+                // thread during dispatch, so closing here is safe.
+                ::close(fd);
                 return;
             }
-            // Blocking write loop (fd is blocking-safe here because we own it
-            // exclusively during dispatch).
-            bool wrote_ok = write_all(fd, hr.response);
-            outbox_.push(WorkerHandback{fd, hr.keep_alive, wrote_ok});
+            // Wake the reactor so it drains the outbox promptly instead of
+            // waiting for the next poller timeout (which would add up to
+            // 100ms of latency per keep-alive request).
             poller_->wakeup();
         });
     }
 
-    static bool write_all(int fd, const std::string& data) {
-        std::size_t total = 0;
+    // Attempt a non-blocking write of [data.data()+off, data.data()+size).
+    // Returns the number of bytes written (>=0), or SIZE_MAX on a hard error
+    // (caller closes the fd). Does NOT busy-spin on EAGAIN — returns the count
+    // written so far so the caller can park the remainder.
+    static std::size_t try_write(int fd, const std::string& data,
+                                 std::size_t off) {
+        std::size_t total = off;
         while (total < data.size()) {
             ssize_t w = ::write(fd, data.data() + total, data.size() - total);
             if (w > 0) {
                 total += static_cast<std::size_t>(w);
-            } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                // Would block; for simplicity, retry (small responses only).
                 continue;
-            } else if (w < 0 && errno == EINTR) {
-                continue;
-            } else if (w < 0) {
-                return false;
             }
+            if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;  // send buffer full; park the remainder
+            }
+            if (w < 0 && errno == EINTR) {
+                continue;
+            }
+            return static_cast<std::size_t>(-1);  // hard error
         }
-        return true;
+        return total;
+    }
+
+    // Begin writing a fresh response on the reactor thread. Writes as much as
+    // possible non-blockingly; on a partial write, parks the remainder on the
+    // connection and arms Writable so the loop drains it later.
+    void begin_write(Connection& conn, std::string response, bool keep_alive) {
+        conn.write_buf = std::move(response);
+        conn.write_off = 0;
+        conn.keep_alive_after_write = keep_alive;
+        continue_write(conn);
+    }
+
+    // Continue (or start) draining conn.write_buf. Fully written → finish the
+    // response (re-arm Readable for keep-alive, else close). Partial → arm
+    // Writable. Hard error → close.
+    void continue_write(Connection& conn) {
+        if (conn.write_off < conn.write_buf.size()) {
+            std::size_t wrote = try_write(conn.fd, conn.write_buf, conn.write_off);
+            if (wrote == static_cast<std::size_t>(-1)) {
+                conn.writing = false;
+                close_connection(conn.fd);
+                return;
+            }
+            conn.write_off = wrote;
+        }
+        if (conn.write_off >= conn.write_buf.size()) {
+            // Fully drained.
+            conn.writing = false;
+            conn.write_buf.clear();
+            conn.write_off = 0;
+            finish_response(conn);
+            return;
+        }
+        // Still have bytes to send: park and arm Writable. Keep read interest
+        // off while writing (the next request can't start until this response
+        // is done).
+        conn.writing = true;
+        poller_->del(conn.fd);
+        poller_->add(conn.fd, EventMask::Writable, nullptr);
+    }
+
+    // A response finished writing successfully: either close or re-arm for the
+    // next request.
+    void finish_response(Connection& conn) {
+        if (conn.keep_alive_after_write) {
+            conn.dispatched = false;
+            conn.read_buf.reset_for_reuse();
+            poller_->del(conn.fd);  // ensure no stale Writable interest
+            poller_->add(conn.fd, EventMask::Readable, nullptr);
+        } else {
+            close_connection(conn.fd);
+        }
     }
 
     void drain_outbox() {
@@ -322,17 +412,16 @@ private:
         while (outbox_.try_pop(hb)) {
             auto it = connections_.find(hb.fd);
             if (it == connections_.end()) continue;
-            if (hb.ok && hb.keep_alive) {
-                // Re-arm the fd for the next request on the same connection.
-                // read_buf was already reset_for_reuse() at dispatch time;
-                // ensure it's clean in case the worker saw a partial next
-                // request (defensive — the fd was detached during dispatch).
-                it->second.dispatched = false;
-                it->second.read_buf.reset_for_reuse();
-                poller_->add(hb.fd, EventMask::Readable, nullptr);
-            } else {
+            Connection& conn = it->second;
+            if (hb.response.empty() && !hb.keep_alive) {
+                // Handler failure (no response, no keep-alive): just close.
                 close_connection(hb.fd);
+                continue;
             }
+            // Begin the (possibly async) write of the response on this thread.
+            // begin_write writes non-blockingly, parking the remainder on conn
+            // + arming Writable if the send buffer fills.
+            begin_write(conn, std::move(hb.response), hb.keep_alive);
         }
     }
 
