@@ -29,6 +29,8 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <expected>
 #include <flat_map>
@@ -37,7 +39,10 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
+#include "muses/bloom_filter.hpp"
 #include "muses/bounded_queue.hpp"
 #include "muses/logging.hpp"
 #include "muses/memory_pool.hpp"
@@ -66,6 +71,13 @@ struct Connection {
     std::size_t write_off = 0;  // next byte to write within write_buf
     bool keep_alive_after_write = false;  // keep-alive decision for this response
     bool writing = false;     // true while a partial write is parked
+    // --- DoS hardening (reactor-thread-only) ---
+    // Last time this connection showed activity (data read, accepted, or a
+    // response cycle completed). The reactor sweep closes connections idle for
+    // longer than idle_timeout (slowloris defense). steady_clock is monotonic.
+    std::chrono::steady_clock::time_point last_active;
+    // Client IPv4 (host byte order) captured at accept, for accounting.
+    std::uint32_t client_ip = 0;
 };
 
 // The reactor owns all fd I/O decisions; worker threads do the heavy compute
@@ -96,14 +108,28 @@ struct WorkerHandback {
 
 class Reactor {
 public:
+    // DoS-hardening knobs (all optional, sensible defaults):
+    //   idle_timeout       — close a connection idle longer than this (slowloris
+    //                        defense). 0 disables the sweep. Default 30s.
+    //   max_connections    — reject new accepts above this live count (fd-exhaustion
+    //                        defense). 0 disables. Default 10000.
+    //   ip_rate_per_sec    — max new connections per source IP per second before it
+    //                        is blacklisted (connection-flood defense). 0 disables.
+    //                        Default 0 (off) so localhost benchmarks aren't tripped.
     Reactor(int listen_fd, RequestHandler handler,
             unsigned worker_threads = 4,
-            std::size_t outbox_capacity = 1024)
+            std::size_t outbox_capacity = 1024,
+            std::chrono::seconds idle_timeout = std::chrono::seconds(30),
+            std::size_t max_connections = 10000,
+            std::size_t ip_rate_per_sec = 0)
     : listen_fd_(listen_fd),
       handler_(std::move(handler)),
       workers_(worker_threads),
       outbox_(outbox_capacity, OverflowPolicy::DropNew),
-      running_(false) {
+      running_(false),
+      idle_timeout_(idle_timeout),
+      max_connections_(max_connections),
+      ip_rate_per_sec_(ip_rate_per_sec) {
         set_nonblocking(listen_fd_);
     }
 
@@ -163,7 +189,50 @@ private:
                 }
             }
             drain_outbox();
+            // Periodic housekeeping: close idle connections (slowloris defense)
+            // and age the per-IP blacklist. Runs roughly every 100ms (the wait
+            // timeout), cheap relative to the wait itself.
+            sweep_idle_connections();
+            sweep_ip_rate();
         }
+    }
+
+    // Close any connection that has been idle (no read / accept / response
+    // activity) for longer than idle_timeout_. Slowloris defense: a client
+    // that opens a connection and trickles bytes (or nothing) gets dropped.
+    void sweep_idle_connections() {
+        if (idle_timeout_ == std::chrono::seconds(0)) return;
+        auto now = std::chrono::steady_clock::now();
+        // Collect first, then close: closing erases from connections_ and
+        // invalidates iterators, so we can't close while iterating.
+        std::vector<int> to_close;
+        for (const auto& [fd, conn] : connections_) {
+            if (now - conn.last_active > idle_timeout_) {
+                to_close.push_back(fd);
+            }
+        }
+        for (int fd : to_close) {
+            close_connection(fd);
+        }
+    }
+
+    // Periodically (a) decay the IP blacklist so a one-off offender is
+    // un-banned after a while, and (b) prune expired entries from the
+    // sliding-window counters so the map doesn't grow unbounded.
+    void sweep_ip_rate() {
+        if (ip_rate_per_sec_ == 0) return;
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_ip_decay_ < std::chrono::seconds(10)) return;
+        last_ip_decay_ = now;
+        ip_blacklist_.decay(1);
+        // Prune counter entries older than the 2s window.
+        std::vector<std::uint32_t> stale;
+        for (const auto& [ip, win] : ip_connect_windows_) {
+            if (now - win.window_start > std::chrono::seconds(2)) {
+                stale.push_back(ip);
+            }
+        }
+        for (std::uint32_t ip : stale) ip_connect_windows_.erase(ip);
     }
 
     void accept_all() {
@@ -173,7 +242,13 @@ private:
         // accept batch. 128 is large enough to amortize the kevent/epoll_wait
         // wakeup while bounding per-iteration work.
         constexpr int kAcceptBatch = 128;
+        auto now = std::chrono::steady_clock::now();
         for (int accepted = 0; accepted < kAcceptBatch; ++accepted) {
+            // DoS gate 1: max live connections. Stop accepting once at the cap
+            // so a connection flood can't exhaust the fd table or memory.
+            if (max_connections_ != 0 && connections_.size() >= max_connections_) {
+                break;
+            }
             sockaddr_in addr{};
             socklen_t len = sizeof(addr);
             int fd = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
@@ -183,9 +258,29 @@ private:
                 MUSES_ERROR("Reactor: accept failed");
                 break;
             }
+            // Capture the client IPv4 (host order) for rate-limit accounting.
+            std::uint32_t ip = ntohl(addr.sin_addr.s_addr);
+            // DoS gate 2: per-IP connection-rate limit. A blacklisted IP (one
+            // that previously exceeded the rate) is rejected without further
+            // work. The blacklist ages out via sweep_ip_rate's decay.
+            if (ip_rate_per_sec_ != 0 && ip != 0) {
+                if (ip_blacklist_.contains(ip)) {
+                    ::close(fd);
+                    continue;
+                }
+                if (ip_rate_exceeded(ip, now)) {
+                    // Just crossed the threshold → blacklist this IP.
+                    ip_blacklist_.add(ip);
+                    MUSES_WARNING(std::format("Reactor: IP {:08x} blacklisted for connection flood", ip));
+                    ::close(fd);
+                    continue;
+                }
+            }
             set_nonblocking(fd);
             Connection conn;
             conn.fd = fd;
+            conn.last_active = now;
+            conn.client_ip = ip;
             // Allocate the read buffer from the reactor's pool (4096-slot size
             // class). Reused across keep-alive requests on this connection.
             conn.read_buf = PooledBuffer(pool_, 4096);
@@ -197,6 +292,25 @@ private:
                 continue;
             }
         }
+    }
+
+    // Sliding-window per-IP new-connection counter. Returns true if `ip` has
+    // exceeded the configured rate within the current 1s window, in which case
+    // the caller blacklists it. The window auto-advances on access; stale
+    // windows are pruned by sweep_ip_rate.
+    struct RateWindow {
+        std::chrono::steady_clock::time_point window_start;
+        std::size_t count = 0;
+    };
+    bool ip_rate_exceeded(std::uint32_t ip, std::chrono::steady_clock::time_point now) {
+        auto& win = ip_connect_windows_[ip];
+        if (now - win.window_start >= std::chrono::seconds(1)) {
+            // Advance the window.
+            win.window_start = now;
+            win.count = 0;
+        }
+        ++win.count;
+        return win.count > ip_rate_per_sec_;
     }
 
     void on_client_event(int fd, const PollEvent& ev) {
@@ -226,6 +340,8 @@ private:
         for (;;) {
             ssize_t r = ::read(fd, buf, sizeof(buf));
             if (r > 0) {
+                // Data arrived → connection is active (refresh idle deadline).
+                conn.last_active = std::chrono::steady_clock::now();
                 std::size_t prev_len = conn.read_buf.size();
                 if (!conn.read_buf.append(buf, static_cast<std::size_t>(r))) {
                     // Pool allocation failure on grow; drop the connection.
@@ -415,6 +531,8 @@ private:
                 close_connection(conn.fd);
                 return;
             }
+            // Bytes flowed out → connection is active.
+            conn.last_active = std::chrono::steady_clock::now();
             conn.write_off = wrote;
         }
         if (conn.write_off >= conn.write_buf.size()) {
@@ -437,6 +555,9 @@ private:
     // next request.
     void finish_response(Connection& conn) {
         if (conn.keep_alive_after_write) {
+            // A response just completed → refresh the idle deadline so a
+            // keep-alive connection isn't swept between requests.
+            conn.last_active = std::chrono::steady_clock::now();
             conn.dispatched = false;
             const int fd = conn.fd;  // capture before any erase could invalidate conn
             // Switch interest back to Readable in ONE poller call (mod) instead
@@ -558,6 +679,17 @@ private:
     // connection set in a contiguous array — better cache locality than a
     // node-based unordered_map for the typically-small fd set.
     std::flat_map<int, Connection> connections_;
+    // --- DoS hardening (reactor-thread-only) ---
+    std::chrono::seconds idle_timeout_;        // 0 = sweep disabled
+    std::size_t max_connections_;              // 0 = cap disabled
+    std::size_t ip_rate_per_sec_;              // 0 = rate limit disabled
+    // Per-IP blacklist (connection flooders). Decayed by sweep_ip_rate so a
+    // one-off offender is auto-unbanned. Sized for ~10k distinct offenders.
+    CountingBloomFilter<std::uint32_t> ip_blacklist_{10000, 0.001};
+    // Sliding-window new-connection counters (per IP, 1s window). Pruned by
+    // sweep_ip_rate. Small (only IPs active in the last 2s are present).
+    std::unordered_map<std::uint32_t, RateWindow> ip_connect_windows_;
+    std::chrono::steady_clock::time_point last_ip_decay_;
 };
 
 // A pool of independent Reactor shards sharing one listen fd. SO_REUSEPORT
@@ -574,10 +706,15 @@ private:
 // win is the N parallel I/O loops; the per-shard worker count can stay small.
 class ReactorPool {
 public:
-    // shard_count reactors; each runs workers_per_shard worker threads.
+    // shard_count reactors; each runs workers_per_shard worker threads. The
+    // DoS-hardening knobs are forwarded to every shard (each enforces them
+    // independently against the connections it owns).
     ReactorPool(int listen_fd, RequestHandler handler,
                 unsigned shard_count, unsigned workers_per_shard,
-                std::size_t outbox_capacity = 1024)
+                std::size_t outbox_capacity = 1024,
+                std::chrono::seconds idle_timeout = std::chrono::seconds(30),
+                std::size_t max_connections = 10000,
+                std::size_t ip_rate_per_sec = 0)
     : listen_fd_(listen_fd),
       handler_(std::move(handler)),
       workers_per_shard_(workers_per_shard == 0 ? 1 : workers_per_shard),
@@ -590,7 +727,8 @@ public:
             // std::function; the typical handler is stateless/captures by ref
             // to long-lived state, so copying is cheap and safe).
             shards_.push_back(std::make_unique<Reactor>(
-                listen_fd_, handler_, workers_per_shard_, outbox_capacity_));
+                listen_fd_, handler_, workers_per_shard_, outbox_capacity_,
+                idle_timeout, max_connections, ip_rate_per_sec));
         }
     }
 

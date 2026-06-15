@@ -139,9 +139,11 @@ on Linux) lets another thread interrupt a blocked `wait()`.
 
 - HTTP/1.1 only; no HTTPS, WebSocket, HTTP/2, routing, or middleware.
 - Static-file serving only (a reverse-proxy example is a planned follow-up).
-- No DoS hardening yet: no idle-timeout (slowloris-vulnerable), no per-IP rate
-  limiting, no max-connection cap. The `CountingBloomFilter` exists for the
-  latter but is not yet wired into the reactor.
+- DoS hardening: idle-timeout (slowloris defense), max-connections cap, and
+  per-IP connection-rate limiting (sliding window + `CountingBloomFilter`
+  blacklist) are implemented and configurable via env vars (`MUSES_IDLE_TIMEOUT`,
+  `MUSES_MAX_CONNECTIONS`, `MUSES_IP_RATE`; all default to safe/off). There is
+  no request-body rate limiting or authentication.
 - Edge-triggered I/O means the read path must drain to EAGAIN and re-check
   buffered pipelined bytes after each response — handled, but it is the kind of
   code that is easy to regress; the pipelined-request test guards it.
