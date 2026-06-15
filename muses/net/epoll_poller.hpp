@@ -32,6 +32,7 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <flat_map>
 #include <vector>
 #include <span>
 
@@ -57,7 +58,8 @@ public:
         }
         struct epoll_event ev{};
         ev.events = EPOLLIN;
-        ev.data.ptr = kWakeTag;
+        // Use a sentinel fd value to recognize the wakeup eventfd in wait().
+        ev.data.fd = kWakeFdSentinel;
         if (::epoll_ctl(epfd_, EPOLL_CTL_ADD, wakefd_, &ev) == -1) {
             MUSES_ERROR("epoll_ctl add eventfd failed");
         }
@@ -75,20 +77,28 @@ public:
         if (epfd_ == -1) return false;
         struct epoll_event ev{};
         ev.events = to_epoll(mask);
-        ev.data.ptr = userdata;
-        return ::epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &ev) == 0;
+        // Stash the fd in data.fd (not data.ptr) so wait() can recover it
+        // directly from the returned event. userdata is tracked separately.
+        ev.data.fd = fd;
+        if (::epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &ev) != 0) return false;
+        fds_[fd] = userdata;
+        return true;
     }
 
     bool mod(int fd, EventMask mask, void* userdata) override {
         if (epfd_ == -1) return false;
         struct epoll_event ev{};
         ev.events = to_epoll(mask);
-        ev.data.ptr = userdata;
-        return ::epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev) == 0;
+        ev.data.fd = fd;
+        if (::epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev) != 0) return false;
+        auto it = fds_.find(fd);
+        if (it != fds_.end()) it->second = userdata;
+        return true;
     }
 
     bool del(int fd) override {
         if (epfd_ == -1) return false;
+        fds_.erase(fd);
         return ::epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr) == 0;
     }
 
@@ -108,7 +118,7 @@ public:
         int out_count = 0;
         for (int i = 0; i < n; ++i) {
             const struct epoll_event& ee = events_[i];
-            if (ee.data.ptr == kWakeTag) {
+            if (ee.data.fd == kWakeFdSentinel) {
                 // Drain the eventfd counter and swallow the wakeup.
                 uint64_t val;
                 ::read(wakefd_, &val, sizeof(val));
@@ -118,9 +128,10 @@ public:
             if ((ee.events & (EPOLLIN | EPOLLHUP)) != 0)  m = m | EventMask::Readable;
             if ((ee.events & (EPOLLOUT | EPOLLHUP)) != 0) m = m | EventMask::Writable;
             if ((ee.events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0) m = m | EventMask::Closed;
-            // Note: fd is not stored (we use data.ptr). Callers that need fd
-            // should embed it in their userdata.
-            out[out_count++] = PollEvent{-1, m, ee.data.ptr};
+            int fd = ee.data.fd;
+            void* ud = nullptr;
+            if (auto it = fds_.find(fd); it != fds_.end()) ud = it->second;
+            out[out_count++] = PollEvent{fd, m, ud};
         }
         return out_count;
     }
@@ -139,11 +150,15 @@ private:
         return e;
     }
 
-    // Sentinel data.ptr identifying the wakeup eventfd.
-    static inline void* kWakeTag = reinterpret_cast<void*>(0x1);
+    // Sentinel fd value stored in epoll_event.data.fd to identify the wakeup
+    // eventfd. Real fds are non-negative, so -1 is unambiguous.
+    static constexpr int kWakeFdSentinel = -1;
 
     int epfd_;
     int wakefd_;
+    // fd → userdata mirror so wait() can return both fd and userdata (epoll's
+    // data union is used for the fd to let us recover it directly).
+    std::flat_map<int, void*> fds_;
     std::vector<struct epoll_event> events_;
 };
 
