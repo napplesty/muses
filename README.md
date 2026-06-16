@@ -33,7 +33,7 @@ Networking stack (`muses/net/`):
 | Poller               | `net/poller.hpp` + `*_poller.hpp` | edge-triggered kqueue/epoll abstraction + `wakeup()` |
 | Reactor              | `net/reactor.hpp`       | sharded (SO_REUSEPORT) reactor pool + async writes + `ReactorPool` |
 | HTTP handler         | `net_components/http_handler.hpp` | static files, CRLF, keep-alive, traversal-safe, LRU-cached |
-| Reverse proxy        | `net_components/proxy.hpp` | coroutine-driven, prefix routing, upstream pool, retry, health (experimental) |
+| Reverse proxy        | `net_components/proxy.hpp` | coroutine-driven, prefix routing, upstream pool, retry, health |
 
 ## Build
 
@@ -156,11 +156,7 @@ on Linux) lets another thread interrupt a blocked `wait()`.
 
 - HTTP/1.1 only; no HTTPS, WebSocket, HTTP/2, routing, or middleware.
 - Static-file serving and a coroutine-driven reverse proxy are provided as
-  examples; neither does TLS/HTTPS, HTTP/2, or WebSocket. The reverse proxy is
-  **experimental**: it passes isolated functional tests (forwarding, routing,
-  502-on-down-upstream, retry) but has a known coroutine-lifetime bug under
-  high concurrency (memory corruption / crash) that is not yet resolved. The
-  coroutine infrastructure (`task.hpp`) itself is tested and stable.
+  examples; neither does TLS/HTTPS, HTTP/2, or WebSocket.
 - DoS hardening: idle-timeout (slowloris defense), max-connections cap, and
   per-IP connection-rate limiting (sliding window + `CountingBloomFilter`
   blacklist) are implemented and configurable via env vars (`MUSES_IDLE_TIMEOUT`,

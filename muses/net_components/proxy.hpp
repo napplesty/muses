@@ -171,12 +171,18 @@ private:
         }
     }
 
-    // Resume a coroutine handle, passing it the poll event so it knows whether
-    // the fd is still usable. On completion, the task self-registers for cleanup.
+    // Resume a coroutine handle. The fd that fired is deregistered BEFORE
+    // resuming: we've consumed this readiness edge, and the coroutine will
+    // re-register interest (via IoAwaiter) on its next co_await. Deregistering
+    // before (not after) resume is critical — after resume the coroutine may
+    // already have re-registered the same fd for a different event (e.g.
+    // Writable→Readable on an upstream), and a post-resume del would wipe
+    // that fresh registration, deadlocking the request.
     void resume_handle(std::coroutine_handle<> h, const PollEvent& ev) {
+        if (ev.fd != listen_fd_) {
+            poller_->del(ev.fd);
+        }
         h.resume();
-        // The coroutine re-registers itself or finishes; reaping happens in
-        // reap_finished_tasks.
     }
 
     // Accept new client connections and spawn a coroutine for each.
