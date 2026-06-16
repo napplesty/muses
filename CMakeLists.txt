@@ -77,3 +77,7 @@ file(COPY ${CMAKE_SOURCE_DIR}/tests/statics DESTINATION ${CMAKE_BINARY_DIR})
 # --- Example: static-file HTTP server ------------------------------------
 add_executable(muses_http_server ${CMAKE_SOURCE_DIR}/examples/http_server.cpp)
 target_link_libraries(muses_http_server PRIVATE muses)
+
+# --- Example: reverse proxy (coroutine-driven) ---------------------------
+add_executable(muses_reverse_proxy ${CMAKE_SOURCE_DIR}/examples/reverse_proxy.cpp)
+target_link_libraries(muses_reverse_proxy PRIVATE muses)

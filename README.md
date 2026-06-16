@@ -22,6 +22,7 @@ General-purpose primitives (`muses/`):
 | Memory pool          | `memory_pool.hpp`       | size-class free-lists + per-alloc refcount + `PoolPtr<T>` + `PooledBuffer` |
 | LRU cache            | `lru_cache.hpp`         | O(1) get/put/erase, mutex-locked, entry-count bounded        |
 | Counting Bloom filter| `bloom_filter.hpp`      | removable, decay-based expiry, mutex-locked                  |
+| Coroutine task       | `task.hpp`              | `Task<T>` + `IoAwaiter`; Poller is the scheduler             |
 | Logger               | `logging.hpp`           | async, single background thread, bounded DropOldest ring     |
 | Profiler             | `profiler.hpp`          | RAII scope timer (micro-benchmark tool)                      |
 
@@ -32,6 +33,7 @@ Networking stack (`muses/net/`):
 | Poller               | `net/poller.hpp` + `*_poller.hpp` | edge-triggered kqueue/epoll abstraction + `wakeup()` |
 | Reactor              | `net/reactor.hpp`       | sharded (SO_REUSEPORT) reactor pool + async writes + `ReactorPool` |
 | HTTP handler         | `net_components/http_handler.hpp` | static files, CRLF, keep-alive, traversal-safe, LRU-cached |
+| Reverse proxy        | `net_components/proxy.hpp` | coroutine-driven, prefix routing, upstream pool, retry, health (experimental) |
 
 ## Build
 
@@ -50,7 +52,7 @@ Disable with `-DMUSES_ENABLE_SANITIZERS=OFF`.
 
 Tests use [doctest](https://github.com/doctest/doctest), fetched via
 `FetchContent` (no manual install). Each `tests/test_*.cpp` is a standalone
-executable registered with CTest. 11 suites, all green under ASan/UBSan.
+executable registered with CTest. 13 suites, all green under ASan/UBSan.
 
 ```bash
 cd build && ctest --output-on-failure
@@ -85,6 +87,21 @@ muses::ReactorPool pool(lfd,
         return {std::move(hr.response), hr.keep_alive};
     }, /*shards=*/4, /*workers_per_shard=*/2);
 pool.start();
+```
+
+## Example: reverse proxy
+
+A second demo, built on the coroutine infrastructure: each client connection
+is a `Task<void>` that forwards requests to a matched upstream over pooled
+keep-alive connections, with retry and health gating. Upstream I/O suspends on
+the Poller instead of blocking a worker — this is what `task.hpp` enables.
+
+```bash
+cd build && ./muses_reverse_proxy
+# listens on http://127.0.0.1:8865/
+#   MUSES_PROXY_PORT   listen port (default 8865)
+# Edit the hardcoded route table in examples/reverse_proxy.cpp and rebuild
+# to route to your backends.
 ```
 
 ## Architecture notes
@@ -138,7 +155,12 @@ on Linux) lets another thread interrupt a blocked `wait()`.
 ## Known limitations
 
 - HTTP/1.1 only; no HTTPS, WebSocket, HTTP/2, routing, or middleware.
-- Static-file serving only (a reverse-proxy example is a planned follow-up).
+- Static-file serving and a coroutine-driven reverse proxy are provided as
+  examples; neither does TLS/HTTPS, HTTP/2, or WebSocket. The reverse proxy is
+  **experimental**: it passes isolated functional tests (forwarding, routing,
+  502-on-down-upstream, retry) but has a known coroutine-lifetime bug under
+  high concurrency (memory corruption / crash) that is not yet resolved. The
+  coroutine infrastructure (`task.hpp`) itself is tested and stable.
 - DoS hardening: idle-timeout (slowloris defense), max-connections cap, and
   per-IP connection-rate limiting (sliding window + `CountingBloomFilter`
   blacklist) are implemented and configurable via env vars (`MUSES_IDLE_TIMEOUT`,

@@ -25,6 +25,7 @@
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <utility>
 #include <variant>
@@ -54,6 +55,24 @@ namespace muses {
 //   - Task is move-only; the moved-from Task is inert (nullptr handle).
 
 template <typename T = void>
+class Task;
+
+namespace detail {
+// final_suspend object: if a continuation (the awaiting coroutine's handle) was
+// registered, resume it when this coroutine finishes. Otherwise just suspend
+// (the owning Task will destroy the frame).
+struct FinalAwaiter {
+    std::coroutine_handle<> continuation;
+    bool await_ready() const noexcept { return false; }
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<>) noexcept {
+        if (continuation) return continuation;  // symmetric transfer to awaiter
+        return std::noop_coroutine();           // no one awaiting; return to caller
+    }
+    void await_resume() noexcept {}
+};
+}  // namespace detail
+
+template <typename T>
 class Task {
 public:
     class promise_type {
@@ -62,7 +81,9 @@ public:
             return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
         }
         std::suspend_always initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
+        detail::FinalAwaiter final_suspend() noexcept {
+            return {continuation_};
+        }
 
         template <typename U>
         void return_value(U&& value) {
@@ -70,9 +91,6 @@ public:
         }
 
         void unhandled_exception() {
-            // Store the exception so the awaiter can rethrow. For simplicity in
-            // a header-only learning project we don't propagate via
-            // std::rethrow_exception here; callers check has_result().
             result_ = std::current_exception();
         }
 
@@ -82,6 +100,7 @@ public:
         T& value() { return std::get<1>(result_); }
         const T& value() const { return std::get<1>(result_); }
 
+        std::coroutine_handle<> continuation_;
     private:
         // 0 = empty, 1 = value, 2 = exception pointer.
         std::variant<std::monostate, T, std::exception_ptr> result_;
@@ -128,6 +147,23 @@ public:
         return h;
     }
 
+    // --- Make Task awaitable (co_await some_task) --------------------------
+    // When a coroutine awaits this Task, it registers itself as the
+    // continuation, then resumes the inner task. When the inner task finishes,
+    // final_suspend symmetric-transfers back to the continuation. The result is
+    // returned via await_resume.
+    bool await_ready() const noexcept {
+        return handle_ == nullptr || handle_.done();
+    }
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> caller) noexcept {
+        handle_.promise().continuation_ = caller;
+        return handle_;  // symmetric transfer: start the inner task
+    }
+    T await_resume() {
+        // The inner task has completed (final_suspend ran, transferring back).
+        return std::move(handle_.promise().value());
+    }
+
 private:
     std::coroutine_handle<promise_type> handle_;
 };
@@ -142,10 +178,11 @@ public:
             return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
         }
         std::suspend_always initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
+        detail::FinalAwaiter final_suspend() noexcept { return {continuation_}; }
         void return_void() noexcept {}
         void unhandled_exception() { ep_ = std::current_exception(); }
         std::exception_ptr ep_;
+        std::coroutine_handle<> continuation_;
     };
 
     Task() noexcept : handle_(nullptr) {}
@@ -181,6 +218,16 @@ public:
         handle_ = nullptr;
         return h;
     }
+
+    // Awaitable: same continuation-transfer pattern as Task<T>.
+    bool await_ready() const noexcept {
+        return handle_ == nullptr || handle_.done();
+    }
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> caller) noexcept {
+        handle_.promise().continuation_ = caller;
+        return handle_;
+    }
+    void await_resume() noexcept {}
 
 private:
     std::coroutine_handle<promise_type> handle_;
